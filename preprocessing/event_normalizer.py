@@ -1,25 +1,35 @@
 """Event normalization for the MyJio Floater Analytics ingestion pipeline.
 
 This module is the **Preprocessing Layer** entry point. It converts a raw
-client telemetry event (shape defined in ``contracts/event_schema.md``) into the
-canonical normalized event record (shape defined in
-``contracts/analytics_contract.md`` §3).
+client telemetry event (shape defined in ``contracts/event_schema.md`` v2.0)
+into the canonical normalized event record.
 
 Responsibilities (and *only* these — this is infrastructure, not analytics):
 
-* **Event-type normalization** — map raw client event names to the four
-  canonical event types using the authoritative mapping table
-  (``analytics_contract.md`` §2). Unmapped events are *quarantined*, never
-  counted (§1).
+* **Event-type normalization / canonical derivation** (event_schema §5,
+  analytics_contract §1) — the platform derives three behavioural events today:
+
+    - ``Recharge floater impression``                            → ``impression``
+    - ``Recharge floater clicks`` + ``label`` has a skip marker   → ``skip``
+    - ``Recharge floater clicks`` + ``label`` has no skip marker  → ``click``
+
+  Skip is **label-derived** (there is no native skip event); the skip rule is
+  evaluated *before* click. Every other ``event_type`` — API plumbing, app
+  lifecycle, navigation, ``Recharge initiated`` — is **quarantined** and can
+  never become impression/click/skip (event_schema §7).
+* **Campaign identification** (event_schema §6) — ``campaign := click_action``
+  (e.g. ``PLANEXPIRY01``), never ``label``. A missing ``click_action`` becomes
+  the ``__unknown_campaign__`` sentinel.
 * **Timestamp normalization** — accept epoch-ms / epoch-s / ISO-8601 / datetime
-  and emit a timezone-aware UTC ``datetime`` (§13 "Time fields are UTC").
-* **Field validation** — enforce presence/typing of the canonical required
-  fields and apply the 5-minute future-skew guard (§3.3).
+  and emit a timezone-aware UTC ``datetime`` (event_schema §9; epoch-ms is the
+  real format).
+* **Field validation** — enforce presence of the core required fields and apply
+  the 5-minute future-skew guard (event_schema §11).
 
 Stateful enrichment (``impression_seq``, ``is_repeat_impression``,
-``time_since_impression_ms``) and conversion attribution (§4) require
-cross-event state and are performed downstream; they are emitted here as
-``None`` placeholders so the record already matches the contract shape.
+``time_since_impression_ms``) and conversion attribution require cross-event
+state and are performed downstream; they are emitted here as ``None``
+placeholders so the record already matches the contract shape.
 """
 
 from __future__ import annotations
@@ -28,7 +38,7 @@ import logging
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from pydantic import BaseModel, Field
 
@@ -36,19 +46,27 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Contract constants (analytics_contract.md §1, §2, §4)
+# Contract constants (event_schema.md §5–§9, analytics_contract.md §1)
 # ---------------------------------------------------------------------------
 
-#: Version of the event-mapping table applied. Bumped whenever the mapping or
-#: canonical taxonomy changes (analytics_contract.md §2 "Mapping is versioned").
-MAPPING_VERSION = "2026.05-v1"
+#: Version of the derivation/mapping rules applied. Bumped to track the v2.0
+#: frozen contracts (event_schema.md / analytics_contract.md, 2026-06-01).
+MAPPING_VERSION = "2026.06-v2"
 
-#: Clock-skew tolerance for future timestamps (analytics_contract.md §3.3).
+#: Clock-skew tolerance for future timestamps (event_schema.md §11).
 FUTURE_SKEW_TOLERANCE = timedelta(minutes=5)
+
+#: Campaign sentinel for rows missing ``click_action`` (event_schema.md §6).
+#: Such rows stay well-defined but are excluded from per-campaign reporting.
+UNKNOWN_CAMPAIGN = "__unknown_campaign__"
 
 
 class CanonicalEventType(str, Enum):
-    """The four canonical event types (analytics_contract.md §1)."""
+    """The canonical behavioural event types (analytics_contract.md §1).
+
+    ``conversion`` is reserved for future telemetry (event_schema.md §10); no
+    raw event maps to it in the current export.
+    """
 
     IMPRESSION = "impression"
     CLICK = "click"
@@ -57,38 +75,31 @@ class CanonicalEventType(str, Enum):
 
 
 class ConversionType(str, Enum):
-    """Conversion sub-types (analytics_contract.md §4.1)."""
+    """Conversion sub-types (event_schema.md §10 — future)."""
 
     RECHARGE = "recharge"
     OTT_SUBSCRIPTION = "ott_subscription"
 
 
-#: Authoritative raw -> canonical mapping (analytics_contract.md §2) merged with
-#: the raw event names observed in contracts/event_schema.md §4. Keys are
-#: matched case-insensitively after stripping surrounding whitespace.
-EVENT_TYPE_MAPPING: dict[str, CanonicalEventType] = {
-    # analytics_contract.md §2 (authoritative)
-    "floater_impression": CanonicalEventType.IMPRESSION,
-    "floater_click": CanonicalEventType.CLICK,
-    "floater_skip": CanonicalEventType.SKIP,
-    "dismiss_popup": CanonicalEventType.SKIP,
-    "recharge_success": CanonicalEventType.CONVERSION,
-    "ott_subscription_success": CanonicalEventType.CONVERSION,
-    # event_schema.md §4 (observed raw names)
-    "recharge floater impression": CanonicalEventType.IMPRESSION,
-    "recharge floater clicks": CanonicalEventType.CLICK,
-}
+#: Raw ``event_type`` values (lower-cased) that derive to ``impression``
+#: (event_schema.md §5.1).
+IMPRESSION_RAW_EVENTS: frozenset[str] = frozenset({"recharge floater impression"})
 
-#: Raw conversion event -> conversion_type (analytics_contract.md §4.1).
+#: Raw ``event_type`` values (lower-cased) that carry the click/skip funnel and
+#: are disambiguated by ``label`` (event_schema.md §5.2–§5.4).
+CLICK_SKIP_RAW_EVENTS: frozenset[str] = frozenset({"recharge floater clicks"})
+
+#: Default skip markers searched (case-insensitively) within ``label``
+#: (event_schema.md §5.2 / §5.4). Configuration-driven; this is the baseline.
+DEFAULT_SKIP_MARKERS: tuple[str, ...] = ("skip", "dismiss")
+
+#: Future conversion raw events -> conversion_type (event_schema.md §10).
+#: Absent from today's data; retained for forward-compatibility. ``Recharge
+#: initiated`` is intent and is intentionally NOT mapped here.
 CONVERSION_TYPE_MAPPING: dict[str, ConversionType] = {
     "recharge_success": ConversionType.RECHARGE,
     "ott_subscription_success": ConversionType.OTT_SUBSCRIPTION,
 }
-
-#: Canonical fields that must be resolvable for an event to be analytics-ready
-#: (analytics_contract.md §3.1 required columns, minus screen_name which is
-#: defaulted rather than dropped — see ``DEFAULT_SCREEN_NAME``).
-REQUIRED_CANONICAL_FIELDS = ("customerId", "sessionId", "campaign")
 
 DEFAULT_SCREEN_NAME = "unknown"
 
@@ -99,30 +110,33 @@ DEFAULT_SCREEN_NAME = "unknown"
 
 
 class NormalizedEvent(BaseModel):
-    """Canonical normalized telemetry record (analytics_contract.md §3).
+    """Canonical normalized telemetry record.
 
     The contract between the ingestion/preprocessing layers and everything
     downstream. Percentage/derived analytics are *not* computed here.
     """
 
-    # §3.1 core fields
+    # Core fields
     event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     customerId: str
     sessionId: str
-    campaign: str
+    campaign: str  # := click_action (event_schema.md §6)
     event_type: CanonicalEventType
     timestamp: datetime
     screen_name: str
+    # The raw click_action value. Equal to ``campaign`` for funnel rows; kept
+    # distinct so a missing value surfaces as ``None`` rather than the sentinel.
     click_action: Optional[str] = None
 
-    # §3.2 derived / enrichment fields populated at this layer
+    # Derived / enrichment fields populated at this layer
     raw_event: str
+    label: Optional[str] = None  # chosen action / CTA (event_schema.md §3)
     conversion_type: Optional[ConversionType] = None
     event_date: date
     mapping_version: str = MAPPING_VERSION
     ingested_at: datetime
 
-    # §3.2 derived fields requiring cross-event state — filled downstream.
+    # Derived fields requiring cross-event state — filled downstream.
     impression_seq: Optional[int] = None
     is_repeat_impression: Optional[bool] = None
     time_since_impression_ms: Optional[int] = None
@@ -139,8 +153,8 @@ class NormalizationResult(BaseModel):
     """Outcome of normalizing a single raw event.
 
     A quarantined result carries the reason and the original payload so the
-    ingestion layer can route it to the quarantine store (analytics_contract.md
-    §1: unmapped/invalid events are *never* counted in metrics).
+    ingestion layer can route it to the quarantine store (event_schema.md §7:
+    unmapped/non-funnel events are *never* counted in metrics).
     """
 
     status: NormalizationStatus
@@ -168,16 +182,23 @@ class EventNormalizer:
     def __init__(
         self,
         *,
-        event_type_mapping: Optional[Mapping[str, CanonicalEventType]] = None,
+        impression_events: Optional[Iterable[str]] = None,
+        click_skip_events: Optional[Iterable[str]] = None,
+        skip_markers: Optional[Iterable[str]] = None,
         conversion_type_mapping: Optional[Mapping[str, ConversionType]] = None,
         mapping_version: str = MAPPING_VERSION,
         future_skew_tolerance: timedelta = FUTURE_SKEW_TOLERANCE,
     ) -> None:
-        # Normalize mapping keys to lower-case for case-insensitive lookup.
-        self._event_type_mapping = {
-            k.strip().lower(): v
-            for k, v in (event_type_mapping or EVENT_TYPE_MAPPING).items()
-        }
+        # Case-insensitive matching on trimmed, lower-cased values (§5.4).
+        self._impression_events = frozenset(
+            e.strip().lower() for e in (impression_events or IMPRESSION_RAW_EVENTS)
+        )
+        self._click_skip_events = frozenset(
+            e.strip().lower() for e in (click_skip_events or CLICK_SKIP_RAW_EVENTS)
+        )
+        self._skip_markers = tuple(
+            m.strip().lower() for m in (skip_markers or DEFAULT_SKIP_MARKERS)
+        )
         self._conversion_type_mapping = {
             k.strip().lower(): v
             for k, v in (conversion_type_mapping or CONVERSION_TYPE_MAPPING).items()
@@ -218,39 +239,43 @@ class EventNormalizer:
         if not raw_event:
             raise _Quarantine("missing_required_field:event_type")
 
-        # Event-type normalization (analytics_contract.md §2).
-        canonical = self._event_type_mapping.get(raw_event.strip().lower())
+        label = self._first_str(raw, "label")
+
+        # Canonical event derivation (event_schema.md §5). Returns None for any
+        # non-funnel event so infrastructure/API events can never become a
+        # behavioural event — they fall through to quarantine.
+        canonical = self._derive_event_type(raw_event, label)
         if canonical is None:
             raise _Quarantine(f"unmapped_event_type:{raw_event}")
 
-        # Field validation (analytics_contract.md §3.1).
+        # Field validation — core required identifiers (event_schema.md §2).
         customer_id = self._first_str(raw, "customerId", "customer_id")
         session_id = self._first_str(raw, "sessionId", "session_id")
-        campaign = self._first_str(raw, "campaign", "label", "campaign_id")
-
         for field_name, value in (
             ("customerId", customer_id),
             ("sessionId", session_id),
-            ("campaign", campaign),
         ):
             if not value:
                 raise _Quarantine(f"missing_required_field:{field_name}")
 
-        # Timestamp normalization -> tz-aware UTC (analytics_contract.md §13).
+        # Campaign := click_action, with sentinel fallback (event_schema.md §6).
+        click_action = self._first_str(raw, "click_action")
+        campaign = click_action or UNKNOWN_CAMPAIGN
+
+        # Timestamp normalization -> tz-aware UTC (event_schema.md §9).
         raw_ts = self._first_present(
-            raw, "timestamp", "event_timestamp", "timestamp_ist"
+            raw, "event_timestamp", "timestamp", "timestamp_ist"
         )
         timestamp = self._normalize_timestamp(raw_ts)
 
         ingested_at = datetime.now(timezone.utc)
-        # Future-skew guard (analytics_contract.md §3.3).
+        # Future-skew guard (event_schema.md §11).
         if timestamp > ingested_at + self.future_skew_tolerance:
             raise _Quarantine("timestamp_in_future")
 
         screen_name = (
             self._first_str(raw, "screen_name", "newscreen_name") or DEFAULT_SCREEN_NAME
         )
-        click_action = self._first_str(raw, "click_action")
 
         conversion_type = None
         if canonical is CanonicalEventType.CONVERSION:
@@ -267,6 +292,7 @@ class EventNormalizer:
             screen_name=screen_name,
             click_action=click_action,
             raw_event=raw_event,
+            label=label,
             conversion_type=conversion_type,
             event_date=timestamp.date(),
             mapping_version=self.mapping_version,
@@ -277,13 +303,53 @@ class EventNormalizer:
             status=NormalizationStatus.NORMALIZED, event=event, raw=raw
         )
 
+    # -- canonical derivation (event_schema.md §5) ------------------------
+
+    def _derive_event_type(
+        self, raw_event: str, label: Optional[str]
+    ) -> Optional[CanonicalEventType]:
+        key = raw_event.strip().lower()
+
+        # §5.1 Impression — clean and unambiguous.
+        if key in self._impression_events:
+            return CanonicalEventType.IMPRESSION
+
+        # §5.2/§5.3 Click vs Skip — same raw event, disambiguated by label.
+        # The skip rule is evaluated BEFORE click; a row is never both (§5.4).
+        if key in self._click_skip_events:
+            if self._has_skip_marker(label):
+                # Data-quality signal: a "clicks" row reclassified to skip
+                # (event_schema.md §5.4 / §11). Logged so a future change to the
+                # label naming convention is detected, not silently mis-counted.
+                logger.info(
+                    "skip_reclassification: event_type=%r label=%r -> skip",
+                    raw_event,
+                    label,
+                )
+                return CanonicalEventType.SKIP
+            return CanonicalEventType.CLICK
+
+        # Future conversion events (event_schema.md §10) — absent today.
+        if key in self._conversion_type_mapping:
+            return CanonicalEventType.CONVERSION
+
+        # Everything else (API plumbing, lifecycle, navigation, intent) is
+        # quarantined — never a behavioural event.
+        return None
+
+    def _has_skip_marker(self, label: Optional[str]) -> bool:
+        if not label:
+            return False
+        label_lower = label.lower()
+        return any(marker in label_lower for marker in self._skip_markers)
+
     # -- timestamp handling ------------------------------------------------
 
     def _normalize_timestamp(self, value: Any) -> datetime:
         """Coerce a raw timestamp into a timezone-aware UTC ``datetime``.
 
-        Accepts epoch milliseconds (per event_schema.md), epoch seconds,
-        ISO-8601 strings, and ``datetime`` objects.
+        Accepts epoch milliseconds (the real format, event_schema.md §9), epoch
+        seconds, ISO-8601 strings, and ``datetime`` objects.
         """
         if value is None:
             raise _Quarantine("missing_required_field:timestamp")
@@ -314,8 +380,8 @@ class EventNormalizer:
 
     @staticmethod
     def _epoch_to_utc(value: float) -> datetime:
-        # Heuristic: values >= 1e12 are milliseconds (year ~2001+ in ms),
-        # otherwise seconds. event_schema.md specifies epoch milliseconds.
+        # Heuristic: values >= 1e12 are milliseconds (event_schema.md §9),
+        # otherwise seconds.
         seconds = value / 1000.0 if abs(value) >= 1e12 else value
         try:
             return datetime.fromtimestamp(seconds, tz=timezone.utc)
@@ -358,9 +424,12 @@ class _Quarantine(Exception):
 __all__ = [
     "CanonicalEventType",
     "ConversionType",
-    "EVENT_TYPE_MAPPING",
+    "IMPRESSION_RAW_EVENTS",
+    "CLICK_SKIP_RAW_EVENTS",
+    "DEFAULT_SKIP_MARKERS",
     "CONVERSION_TYPE_MAPPING",
     "MAPPING_VERSION",
+    "UNKNOWN_CAMPAIGN",
     "NormalizedEvent",
     "NormalizationResult",
     "NormalizationStatus",

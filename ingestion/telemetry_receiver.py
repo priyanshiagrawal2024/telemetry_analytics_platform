@@ -53,8 +53,12 @@ class RawTelemetryEvent(BaseModel):
     )
 
     # Optional — resolved/validated during normalization.
+    # NOTE: per event_schema.md v2 §3/§6, `label` is the chosen action (carries
+    # the skip signal), NOT the campaign — the campaign is `click_action`. It is
+    # passed through untouched so the normalizer can derive click vs skip.
+    label: Optional[str] = None
     campaign: Optional[str] = Field(
-        default=None, validation_alias=AliasChoices("campaign", "label", "campaign_id")
+        default=None, validation_alias=AliasChoices("campaign", "campaign_id")
     )
     timestamp: Optional[Any] = Field(
         default=None,
