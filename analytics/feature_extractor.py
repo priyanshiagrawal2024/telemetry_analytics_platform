@@ -1,61 +1,85 @@
 """Customer-level feature extraction for the MyJio Floater Analytics Platform.
 
-Layer position (see ``CLAUDE.md`` architecture):
+Layer position (see ``CLAUDE.md`` / ``docs/project_context.md`` §7)::
 
     Telemetry Events
-        -> Ingestion Layer
-        -> Preprocessing Layer
-        -> Feature Extraction      <-- THIS MODULE
+        -> Ingestion Layer        (TelemetryLoader)        <-- THIS MODULE
+        -> Preprocessing Layer    (EventClassifier)        <-- THIS MODULE
+        -> Feature Extraction     (FeatureExtractor)       <-- THIS MODULE
         -> Analytics Engine
         -> Insight Generation
         -> Dashboard
 
-This module consumes a *cleaned* telemetry event :class:`pandas.DataFrame` and
-produces a **customer profile** :class:`pandas.DataFrame` whose schema matches
-**§5 Customer Profile Schema** of ``contracts/analytics_contract.md`` exactly.
-The profile is the primary input to the Segmentation step.
+This module turns a **raw MyJio telemetry export** into a **customer profile**
+:class:`pandas.DataFrame` (one row per ``customerId``) whose schema matches
+**§6 Customer Profile Schema** of ``contracts/analytics_contract.md`` (v2.0,
+FROZEN). It is the primary input to the downstream analyses:
+``fatigue_analysis``, ``campaign_analysis``, ``segmentation_analysis``,
+``trend_analysis``, ``engagement_analysis``.
 
-Source-of-truth documents (no metric / mapping / schema is invented outside
-them):
-* ``contracts/analytics_contract.md`` — metric formulas (§7/§8), profile
-  schema (§5), event taxonomy (§1), event mappings (§2), segmentation (§9),
-  calculation conventions (§13).
-* ``contracts/event_schema.md`` — raw telemetry fields (§1/§2), the raw->
-  canonical mapping available in the *current* sample (§4) and the events
-  reserved for a **future extension** (§6).
+Source-of-truth documents (FROZEN — no metric / mapping / schema is invented
+outside them):
 
-Capability gating
------------------
-``event_schema.md`` §4 only maps ``impression`` and ``click`` today; ``skip``
-and ``conversion`` are §6 *future* telemetry. Accordingly, any metric whose
-source events are absent from the input is emitted as an explicit **placeholder
-(``<NA>`` / ``NaN``) with a logged warning** rather than a misleading zero. When
-that telemetry arrives, the same code computes the metric with no changes.
+* ``contracts/event_schema.md`` v2.0 — file format (§1), fields (§2/§3),
+  canonical event derivation (§5), campaign identifier (§6), quarantine
+  families (§7), customer journey (§8), timestamps (§9), future conversions
+  (§10).
+* ``contracts/analytics_contract.md`` v2.0 — derivation rules (§1), capability
+  gating (§2), supported metrics (§3), unsupported/placeholder metrics (§4),
+  future metrics (§5), profile schema (§6), single-customer limits (§7),
+  conventions/guardrails (§8).
+* ``docs/telemetry_data_findings.md`` — validation evidence for the above.
+
+Key validated realities encoded here
+-------------------------------------
+* The shipped ``sample_data/telemetry_sample.csv`` is an **XLSX workbook**
+  (``PK`` zip signature) despite its ``.csv`` name -> sniff magic bytes.
+* ``event_timestamp`` is **epoch milliseconds**, not ISO-8601.
+* **Skip is not a native event.** A dismissal is a ``Recharge floater clicks``
+  row whose ``label`` contains a ``skip``/``dismiss`` marker (e.g.
+  ``Recharge-skip``). Skip is therefore *label-derived*.
+* The **campaign key is ``click_action``** (e.g. ``PLANEXPIRY01``), never
+  ``label`` (which holds the chosen action on a click).
+* **No conversion telemetry** exists yet (``Recharge initiated`` is intent, not
+  a completed outcome) -> conversion metrics are placeholders.
+
+Capability gating (§2)
+----------------------
+Any metric whose source events are absent is emitted as an explicit
+**placeholder (``<NA>`` / ``NaN`` / ``None``) with a logged warning**, never a
+misleading ``0``. The same code computes the metric unchanged once the
+telemetry arrives.
 
 This is an **analytics** module: rule-based, explainable, no recommendations,
-no personalisation, no ML.
+no personalisation, no ML (guardrails §8).
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field, fields
-from typing import Dict, List, Mapping, Optional, Set
+from pathlib import Path
+from typing import Dict, FrozenSet, List, Mapping, Optional, Set, Union
 
 import numpy as np
 import pandas as pd
 
 __all__ = [
-    "CustomerProfile",
+    "TelemetryLoader",
+    "EventClassifier",
+    "EventClassifierConfig",
+    "FeatureExtractor",
     "FeatureExtractorConfig",
-    "extract_features",
+    "CustomerProfile",
+    "extract_customer_profiles",
 ]
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Canonical event taxonomy (analytics_contract.md §1)
-# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# Canonical taxonomy & contract constants (event_schema.md §4/§5/§7/§10)
+# ===========================================================================
 
 EVENT_IMPRESSION = "impression"
 EVENT_CLICK = "click"
@@ -69,786 +93,898 @@ CANONICAL_EVENTS: Set[str] = {
     EVENT_CONVERSION,
 }
 
-#: Raw-event -> canonical-event mapping, merged from analytics_contract.md §2
-#: and event_schema.md §4. Matched case-insensitively (see ``_normalise_key``).
-#: Entries flagged "future" below are valid mappings that simply do not appear
-#: in the current telemetry sample (event_schema.md §6).
+#: Raw ``event_type`` -> canonical event (matched case-insensitively). Entries
+#: flagged "future" are valid mappings that simply do not appear in the current
+#: telemetry (event_schema.md §10). Skip is intentionally NOT here: it is
+#: derived from the ``label`` of a click row (§5.2), not from ``event_type``.
 DEFAULT_EVENT_MAPPING: Dict[str, str] = {
-    # --- present in current sample (event_schema.md §4) -------------------
+    # --- present in the validated sample (event_schema.md §4) -------------
     "recharge floater impression": EVENT_IMPRESSION,
     "recharge floater clicks": EVENT_CLICK,
-    "recharge floater click": EVENT_CLICK,
-    # --- analytics_contract.md §2 canonical names -------------------------
-    "floater_impression": EVENT_IMPRESSION,
-    "floater_click": EVENT_CLICK,
-    "floater_skip": EVENT_SKIP,            # future (no skip telemetry yet)
-    "dismiss_popup": EVENT_SKIP,           # future
-    "recharge_success": EVENT_CONVERSION,  # future (event_schema.md §6)
-    "ott_subscription_success": EVENT_CONVERSION,  # future
+    "recharge floater click": EVENT_CLICK,  # singular tolerance
+    # --- future conversion telemetry (event_schema.md §10) ----------------
+    "recharge_success": EVENT_CONVERSION,
+    "ott_subscription_success": EVENT_CONVERSION,
+    "fiber_activation_success": EVENT_CONVERSION,
+    "upi_success": EVENT_CONVERSION,
 }
 
-#: Known non-behavioural / lifecycle events (event_schema.md §3/§4). They are
-#: legitimate telemetry but do not feed any §5 profile metric, so they are
-#: dropped quietly (debug-logged) rather than quarantined as unknown.
-KNOWN_NON_BEHAVIOURAL: Set[str] = {
-    "floaterresponse",
-    "campaign_response_received",
-    "campaign_response_received_empty",
-    "campaign_saved_in_db",
-    "floater api called",
-    "floater api response received",
-}
+#: Known infrastructure / lifecycle / other-surface events (event_schema.md
+#: §7). Legitimate telemetry that carries NO floater funnel -> dropped quietly
+#: (debug-logged), never quarantined as "unknown". Matched case-insensitively;
+#: ``HOME_API_STATUS-*`` / ``ENTERTAINMENT_API_STATUS-*`` handled by prefix.
+QUARANTINE_EVENT_TYPES: FrozenSet[str] = frozenset(
+    {
+        # Floater API plumbing
+        "floaterresponse",
+        "floater api called",
+        "floater api response received",
+        "campaign_response_received",
+        "campaign_response_received_empty",
+        "campaign_saved_in_db",
+        # Home / API status
+        "homeapi request body",
+        "burgermenu api called",
+        "burgermenu api called-success--{body_notempty}",
+        # App lifecycle
+        "app open",
+        "app background",
+        "app closed",
+        # Other surfaces / navigation
+        "navigation_superapp",
+        "home_superapp",
+        "home",
+        "jiocloud_login",
+        "jiocloud_onboarding",
+        "cloud_registered",
+        "cloud_not_registered",
+        "jiotune activated no",
+        # Intent, NOT a conversion (event_schema.md §8/§10)
+        "recharge initiated",
+    }
+)
 
-#: Columns the extractor requires on the input frame.
-REQUIRED_COLUMNS: tuple[str, ...] = ("customerId", "event_type", "event_timestamp")
+#: Prefixes for families of status events that should be quarantined wholesale.
+QUARANTINE_EVENT_PREFIXES: tuple = ("home_api_status", "entertainment_api_status")
 
-#: Sentinel for a missing campaign label so campaign-scoped logic stays defined.
-_UNKNOWN_CAMPAIGN = "__unknown_campaign__"
+#: Columns the classifier needs to derive canonical events.
+REQUIRED_COLUMNS: tuple = ("customerId", "event_type", "event_timestamp")
+
+#: Sentinel for a missing campaign so campaign-scoped logic stays defined (§6).
+UNKNOWN_CAMPAIGN = "__unknown_campaign__"
+
+# Tidy column set produced by EventClassifier and consumed by FeatureExtractor.
+_CLASSIFIED_COLUMNS = [
+    "customerId",
+    "sessionId",
+    "campaign",
+    "event",
+    "event_timestamp",
+    "impression_seq",
+    "is_repeat_impression",
+]
 
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 1. TelemetryLoader  (Ingestion Layer — event_schema.md §1)
+# ===========================================================================
+
+#: ZIP local-file-header magic. XLSX (OOXML) files are ZIP containers.
+_ZIP_MAGIC = b"PK"
+
+
+class TelemetryLoader:
+    """Load a raw telemetry export, auto-detecting XLSX-vs-CSV from content.
+
+    The shipped sample is an XLSX workbook despite its ``.csv`` extension; the
+    extension is *not trusted*. The real format is sniffed from the leading
+    magic bytes (event_schema.md §1).
+
+    Example
+    -------
+    >>> df = TelemetryLoader().load("sample_data/telemetry_sample.csv")
+    """
+
+    def __init__(self, excel_engine: str = "openpyxl") -> None:
+        self.excel_engine = excel_engine
+
+    def load(self, path: Union[str, Path]) -> pd.DataFrame:
+        """Return the raw telemetry as a DataFrame (one row per event).
+
+        Raises
+        ------
+        FileNotFoundError
+            If ``path`` does not exist.
+        """
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Telemetry file not found: {path}")
+
+        with path.open("rb") as fh:
+            head = fh.read(2)
+
+        if head == _ZIP_MAGIC:
+            logger.info(
+                "Detected XLSX content in %s (PK magic); reading via %s.",
+                path.name,
+                self.excel_engine,
+            )
+            df = pd.read_excel(path, engine=self.excel_engine)
+        else:
+            logger.info("Reading %s as delimited text (CSV).", path.name)
+            df = pd.read_csv(path)
+
+        logger.info("Loaded %d telemetry rows x %d columns.", len(df), df.shape[1])
+        return df
+
+
+# ===========================================================================
+# 2. EventClassifier  (Preprocessing Layer — event_schema.md §5/§6/§7)
+# ===========================================================================
 
 
 @dataclass(frozen=True)
-class FeatureExtractorConfig:
-    """Tunable inputs for :func:`extract_features`.
+class EventClassifierConfig:
+    """Column names and rules for canonical event derivation.
+
+    Defaults match the FROZEN MyJio export schema.
 
     Attributes
     ----------
+    customer_col, session_col, event_type_col, timestamp_col:
+        Source column names. ``timestamp_col`` is epoch **milliseconds**.
+    campaign_col:
+        Campaign identifier column. **``click_action``** per event_schema §6
+        (NOT ``label``).
+    action_col:
+        Column carrying the chosen action, scanned for skip markers
+        (``label`` per §5.2).
+    skip_markers:
+        Substrings that mark a click row as a dismissal/skip (§5.2).
     event_mapping:
-        Raw-event-name -> canonical-event mapping (matched case-insensitively).
-    customer_col, session_col, campaign_col, event_type_col, timestamp_col:
-        Column names on the input frame. ``timestamp_col`` must be epoch
-        **milliseconds** (event_schema.md §1 ``event_timestamp``).
+        Raw ``event_type`` -> canonical event (case-insensitive).
     """
 
+    customer_col: str = "customerId"
+    session_col: str = "sessionId"
+    event_type_col: str = "event_type"
+    timestamp_col: str = "event_timestamp"
+    campaign_col: str = "click_action"
+    action_col: str = "label"
+    skip_markers: FrozenSet[str] = frozenset({"skip", "dismiss"})
     event_mapping: Mapping[str, str] = field(
         default_factory=lambda: dict(DEFAULT_EVENT_MAPPING)
     )
-    customer_col: str = "customerId"
-    session_col: str = "sessionId"
-    campaign_col: str = "label"
-    event_type_col: str = "event_type"
-    timestamp_col: str = "event_timestamp"
 
-    # Optional column whose value REFINES a mapped event. In the real MyJio
-    # export a dismissal is logged as a "...clicks" event whose action label
-    # marks it as a skip (e.g. label "Recharge-skip"). When ``action_col`` is
-    # set, any mapped ``click`` whose action value contains a
-    # ``skip_label_markers`` substring is reclassified to ``skip``
-    # (analytics_contract.md §2: dismiss_popup / floater_skip -> skip).
-    action_col: Optional[str] = None
-    skip_label_markers: frozenset = frozenset({"skip", "dismiss"})
 
-    # Thresholds backing ``delayed_responder_flag`` (see CustomerProfile). A
-    # customer is "delayed" if they typically need more than
-    # ``delayed_impressions_threshold`` exposures before clicking, OR take longer
-    # than ``delayed_response_seconds`` seconds to click after an impression.
-    # Both are config-driven per analytics_contract.md §13 (thresholds are
-    # configuration, defaults are the contract baseline).
-    delayed_response_seconds: float = 60.0
-    delayed_impressions_threshold: int = 3
+class EventClassifier:
+    """Derive canonical floater events from raw telemetry (event_schema §5).
 
-    @classmethod
-    def for_myjio_sample(cls) -> "FeatureExtractorConfig":
-        """Preset tuned to the real ``sample_data/telemetry_sample.csv`` export.
+    Produces a tidy frame restricted to behavioural funnel events
+    (``impression`` / ``click`` / ``skip`` and, in future, ``conversion``),
+    with the campaign resolved from ``click_action`` and impression sequence
+    numbers attached. Infrastructure/lifecycle events (§7) are dropped quietly;
+    genuinely unknown event types are quarantined and warned about.
+    """
 
-        Schema realities this preset encodes (discovered from the actual file,
-        which is an XLSX workbook despite the ``.csv`` name):
+    def __init__(self, config: Optional[EventClassifierConfig] = None) -> None:
+        self.config = config or EventClassifierConfig()
+        self._mapping = {
+            self._norm(k): v for k, v in self.config.event_mapping.items()
+        }
 
-        * The recharge floater is the well-formed behavioural funnel:
-          ``Recharge floater impression`` -> impression and
-          ``Recharge floater clicks``     -> click (already in
-          :data:`DEFAULT_EVENT_MAPPING`).
-        * **Skips are embedded in click rows.** A "Recharge floater clicks"
-          event whose ``label`` is "Recharge-skip" is a dismissal -> ``skip``.
-          We therefore scan ``label`` (``action_col``) for skip markers.
-        * **The stable campaign key is ``click_action``** (e.g. "PLANEXPIRY01").
-          On a click the ``label`` holds the ACTION ("Recharge-skip",
-          "Recharge-Explore all plans"), NOT the campaign, so ``label`` must not
-          be used as the campaign key.
-        * Conversion events (recharge_success / ott_subscription_success) are
-          absent ("Recharge initiated" is intent, not a completed outcome), so
-          conversion metrics remain placeholders (event_schema.md §6).
+    # -- public API --------------------------------------------------------
+
+    def classify(self, events: pd.DataFrame) -> pd.DataFrame:
+        """Return the tidy classified funnel frame (``_CLASSIFIED_COLUMNS``).
+
+        Raises
+        ------
+        TypeError
+            If ``events`` is not a DataFrame.
+        ValueError
+            If required columns are missing.
         """
-        return cls(
-            event_type_col="event_type",
-            campaign_col="click_action",
-            action_col="label",
-            timestamp_col="event_timestamp",
+        self._validate(events)
+        if events.empty:
+            logger.warning("Received empty telemetry frame.")
+            return self._empty()
+
+        df = events.copy()
+        cfg = self.config
+
+        # --- map event_type -> canonical -----------------------------------
+        keys = df[cfg.event_type_col].map(self._norm)
+        df["event"] = keys.map(self._mapping)
+
+        # --- label-derived skip (§5.2): reclassify marked clicks -----------
+        df = self._apply_skip_rule(df)
+
+        # --- drop quarantine / unknown (§7) --------------------------------
+        df = self._drop_non_behavioural(df, keys)
+        if df.empty:
+            logger.warning("No canonical behavioural events after classification.")
+            return self._empty()
+
+        # --- normalise identity / campaign / timestamp --------------------
+        df = self._normalise_columns(df)
+        df = self._coerce_timestamp(df)
+        if df.empty:
+            return self._empty()
+
+        # --- impression sequencing (event_schema §8) ----------------------
+        df = self._add_impression_sequence(df)
+
+        logger.info(
+            "Classified %d behavioural events (%s).",
+            len(df),
+            df["event"].value_counts().to_dict(),
+        )
+        return df[_CLASSIFIED_COLUMNS].reset_index(drop=True)
+
+    @staticmethod
+    def present_events(classified: pd.DataFrame) -> Set[str]:
+        """Canonical events actually present (drives capability gating §2)."""
+        if classified.empty:
+            return set()
+        return set(classified["event"].dropna().unique())
+
+    # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    def _norm(value: object) -> str:
+        return str(value).strip().lower()
+
+    def _validate(self, events: pd.DataFrame) -> None:
+        if not isinstance(events, pd.DataFrame):
+            raise TypeError(
+                f"`events` must be a pandas DataFrame, got {type(events).__name__}."
+            )
+        required = set(REQUIRED_COLUMNS) | {
+            self.config.customer_col,
+            self.config.event_type_col,
+            self.config.timestamp_col,
+        }
+        missing = sorted(required - set(events.columns))
+        if missing:
+            raise ValueError(
+                f"Telemetry frame is missing required column(s): {missing}. "
+                f"Present columns: {sorted(events.columns)}."
+            )
+
+    def _apply_skip_rule(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Reclassify ``click`` rows whose action label marks a skip (§5.2)."""
+        cfg = self.config
+        if cfg.action_col not in df.columns or not cfg.skip_markers:
+            logger.debug("Skip refinement disabled (no action col / markers).")
+            return df
+        markers = tuple(m.strip().lower() for m in cfg.skip_markers if m)
+        action = df[cfg.action_col].map(self._norm)
+        looks_skip = action.apply(lambda s: any(m in s for m in markers))
+        reclassified = df["event"].eq(EVENT_CLICK) & looks_skip
+        n = int(reclassified.sum())
+        if n:
+            # Data-quality signal (§5.4): surfaces label-convention changes.
+            logger.info(
+                "Reclassified %d click(s) -> skip via %s marker(s) in `%s`.",
+                n,
+                list(markers),
+                cfg.action_col,
+            )
+            df.loc[reclassified, "event"] = EVENT_SKIP
+        return df
+
+    def _drop_non_behavioural(
+        self, df: pd.DataFrame, keys: pd.Series
+    ) -> pd.DataFrame:
+        """Drop quarantine families quietly; warn on truly-unknown types."""
+        unmapped = df["event"].isna()
+        if not unmapped.any():
+            return df
+
+        is_quarantine = keys.apply(self._is_quarantine)
+        n_known = int((unmapped & is_quarantine).sum())
+        if n_known:
+            logger.debug("Dropping %d infrastructure/lifecycle event(s).", n_known)
+
+        truly_unknown = unmapped & ~is_quarantine
+        n_unknown = int(truly_unknown.sum())
+        if n_unknown:
+            sample = (
+                df.loc[truly_unknown, self.config.event_type_col]
+                .astype(str)
+                .value_counts()
+                .head(10)
+                .to_dict()
+            )
+            logger.warning(
+                "Quarantining %d event(s) with UNKNOWN raw type (top: %s).",
+                n_unknown,
+                sample,
+            )
+        return df.loc[~unmapped].copy()
+
+    @staticmethod
+    def _is_quarantine(key: str) -> bool:
+        return key in QUARANTINE_EVENT_TYPES or key.startswith(
+            QUARANTINE_EVENT_PREFIXES
         )
 
+    def _normalise_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        cfg = self.config
+        df["customerId"] = df[cfg.customer_col].astype("string")
+        df["sessionId"] = (
+            df[cfg.session_col].astype("string")
+            if cfg.session_col in df.columns
+            else pd.Series(pd.NA, index=df.index, dtype="string")
+        )
+        campaign = (
+            df[cfg.campaign_col].astype("string")
+            if cfg.campaign_col in df.columns
+            else pd.Series(pd.NA, index=df.index, dtype="string")
+        )
+        df["campaign"] = campaign.fillna(UNKNOWN_CAMPAIGN)
+        return df
 
-# ---------------------------------------------------------------------------
-# Output schema  (analytics_contract.md §5 — column order is binding)
-# ---------------------------------------------------------------------------
+    def _coerce_timestamp(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Coerce epoch-ms timestamps; drop malformed rows (event_schema §9)."""
+        df["event_timestamp"] = pd.to_numeric(
+            df[self.config.timestamp_col], errors="coerce"
+        )
+        bad = int(df["event_timestamp"].isna().sum())
+        if bad:
+            logger.warning(
+                "Dropping %d event(s) with non-numeric `%s`.",
+                bad,
+                self.config.timestamp_col,
+            )
+            df = df.loc[df["event_timestamp"].notna()].copy()
+        return df
+
+    @staticmethod
+    def _add_impression_sequence(df: pd.DataFrame) -> pd.DataFrame:
+        """Add ``impression_seq`` / ``is_repeat_impression`` (event_schema §8).
+
+        Per ``(customerId, campaign)`` impressions are numbered 1..N
+        chronologically; repeats are every exposure after the first.
+        """
+        df = df.sort_values("event_timestamp", kind="stable").copy()
+        is_impr = df["event"].eq(EVENT_IMPRESSION)
+        seq = (
+            df.loc[is_impr]
+            .groupby(["customerId", "campaign"], sort=False)
+            .cumcount()
+            + 1
+        )
+        df["impression_seq"] = seq  # aligns by index; NaN for non-impressions
+        df["is_repeat_impression"] = df["impression_seq"].gt(1).fillna(False)
+        return df
+
+    @staticmethod
+    def _empty() -> pd.DataFrame:
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in _CLASSIFIED_COLUMNS})
+
+
+# ===========================================================================
+# Customer profile schema  (analytics_contract.md §6 — column order binding)
+# ===========================================================================
 
 
 @dataclass
 class CustomerProfile:
-    """Per-customer behavioural profile (one output row), schema = §5.
+    """Per-customer behavioural profile (one output row), schema = §6.
 
-    Percentages are 0-100; ``attention_score``/``exploration_score`` are 0-1.
-    Fields that cannot be computed from the current telemetry sample carry
-    ``pd.NA`` / ``NaN`` / ``None`` placeholders (see module docstring).
+    Percentages are 0-100; ``attention_score`` / ``exploration_score`` /
+    ``campaign_diversity_score`` are 0-1. Fields not computable from the
+    current telemetry carry ``pd.NA`` / ``NaN`` / ``None`` placeholders (§2/§4).
     """
 
     customerId: str
     first_seen: Optional[pd.Timestamp] = None
     last_seen: Optional[pd.Timestamp] = None
 
-    # --- Event Counts -----------------------------------------------------
+    # --- Core funnel counts ----------------------------------------------
     total_impressions: int = 0
     total_clicks: int = 0
-    total_skips: Optional[int] = None        # TODO: needs skip telemetry (§6)
-    total_conversions: Optional[int] = None  # TODO: needs conversion telemetry (§6)
+    total_skips: Optional[int] = None        # label-derived (§3); NA if absent
+    total_conversions: Optional[int] = None  # §4 placeholder (no telemetry)
     repeat_impressions: int = 0
     unique_campaigns_seen: int = 0
     unique_campaigns_clicked: int = 0
 
-    # --- Rate Metrics (0-100, %) -----------------------------------------
+    # --- Rate metrics (0-100 %) ------------------------------------------
     ctr: float = np.nan
-    skip_rate: float = np.nan          # TODO: needs skip telemetry (§6)
-    conversion_rate: float = np.nan    # TODO: needs conversion telemetry (§6)
+    skip_rate: float = np.nan          # label-derived (§3)
+    conversion_rate: float = np.nan    # §4 placeholder
     repeat_impression_rate: float = np.nan
 
-    # --- Time-Based Metrics (seconds) ------------------------------------
+    # --- Time metrics (seconds) ------------------------------------------
     avg_time_to_click_sec: float = np.nan
-    avg_time_to_skip_sec: float = np.nan  # TODO: needs skip telemetry (§6)
+    avg_time_to_skip_sec: float = np.nan   # label-derived (§3)
     avg_session_depth: float = np.nan
 
-    # --- Fatigue Metrics --------------------------------------------------
-    # TODO: §7.8 composite needs skip_rate AND temporal ctr_decline
-    #       (previous_ctr − current_ctr), the latter owned by the Analytics
-    #       Engine (period-over-period). Not computable in a single snapshot.
+    # --- Fatigue (§4 placeholder: needs population + temporal CTR decline)-
     fatigue_score: float = np.nan
 
-    # --- Engagement Metrics ----------------------------------------------
-    attention_score: float = np.nan  # TODO: clicks/(clicks+skips) needs skips
+    # --- Engagement ------------------------------------------------------
+    attention_score: float = np.nan   # label-derived (§3)
     first_impression_success: bool = False
 
-    # --- Exploration Metrics ---------------------------------------------
+    # --- Exploration -----------------------------------------------------
     exploration_score: float = np.nan  # 0-1
 
-    # --- Segmentation (filled by the Segmentation module, §9) -------------
-    segments: List[str] = field(default_factory=list)  # TODO: segmentation step
-    primary_segment: Optional[str] = None               # TODO: segmentation step
+    # --- Segmentation (§4/§5 placeholder: needs population) ---------------
+    segments: List[str] = field(default_factory=list)
+    primary_segment: Optional[str] = None
 
-    # --- Lineage ----------------------------------------------------------
+    # --- Lineage ---------------------------------------------------------
     profile_updated_at: Optional[pd.Timestamp] = None
 
-    # --- Extended derived metrics (targeted additions; appended AFTER the §5
-    #     schema so the binding §5 column order is preserved exactly) ---------
-    # Mean impressions seen before a customer's first click (avg over clicked
-    # campaigns). Supports delayed_responder_flag. NaN for non-clickers.
+    # --- Extended supported metrics (§3; appended AFTER core §6 fields) ---
     avg_impressions_before_click: float = np.nan
-    # unique_campaigns_clicked / unique_campaigns_seen (0-1). NOTE: by formula
-    # this equals exploration_score (§8.8); kept as a business-friendly alias.
-    campaign_diversity_score: float = np.nan
-    # Per-customer % of CLICKED campaigns clicked on first exposure (0-100).
-    # Per-customer analogue of the population rate in §8.5. NaN for non-clickers.
-    first_impression_success_rate: float = np.nan
-    # True if the customer engages slowly: many exposures before clicking OR a
-    # long average time-to-click (thresholds in FeatureExtractorConfig).
+    campaign_diversity_score: float = np.nan   # alias of exploration_score
+    first_impression_success_rate: float = np.nan  # per-customer (§3 #13)
     delayed_responder_flag: bool = False
 
     @classmethod
     def column_order(cls) -> List[str]:
-        """Return the §5 column order (dataclass field order)."""
+        """Binding §6 column order (dataclass field order)."""
         return [f.name for f in fields(cls)]
 
 
-# ---------------------------------------------------------------------------
-# Public entrypoint
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 3. FeatureExtractor  (Feature Extraction Layer — analytics_contract §3/§6)
+# ===========================================================================
 
 
-def extract_features(
-    events: pd.DataFrame,
-    config: Optional[FeatureExtractorConfig] = None,
+@dataclass(frozen=True)
+class FeatureExtractorConfig:
+    """Config-driven thresholds (analytics_contract §3 #14 / §8).
+
+    A customer is a "delayed responder" if they typically need more than
+    ``delayed_impressions_threshold`` exposures before clicking, OR take longer
+    than ``delayed_response_seconds`` to click on average.
+    """
+
+    delayed_response_seconds: float = 60.0
+    delayed_impressions_threshold: int = 3
+
+
+class FeatureExtractor:
+    """Build per-customer profiles from classified events (schema = §6).
+
+    Consumes the tidy frame from :class:`EventClassifier` and returns one row
+    per ``customerId``. Supported metrics (§3) are computed; unsupported ones
+    (§4) are emitted as placeholders with logged warnings (§2).
+    """
+
+    def __init__(self, config: Optional[FeatureExtractorConfig] = None) -> None:
+        self.config = config or FeatureExtractorConfig()
+
+    # -- public API --------------------------------------------------------
+
+    def extract(self, classified: pd.DataFrame) -> pd.DataFrame:
+        """Return the customer profile DataFrame (binding §6 column order)."""
+        if not isinstance(classified, pd.DataFrame):
+            raise TypeError(
+                f"`classified` must be a DataFrame, got {type(classified).__name__}."
+            )
+        if classified.empty:
+            logger.warning("No usable events; returning empty profile frame.")
+            return self._empty_profile()
+
+        work = classified  # already tidy & validated by EventClassifier
+        present = EventClassifier.present_events(work)
+        self._log_capabilities(present)
+
+        counts = self._event_counts(work, present)
+        diversity = self._campaign_diversity(work)
+        depth = self._session_depth(work)
+        timestamps = self._event_timestamps(work)
+        click_latency = self._reaction_latency(work, EVENT_CLICK)
+        skip_latency = self._reaction_latency(work, EVENT_SKIP)
+
+        # First-exposure analysis computed ONCE, reused by three metrics.
+        exposure = self._first_click_exposure(work)
+        fis = self._first_impression_success(exposure)
+        fis_rate = self._first_impression_success_rate(exposure)
+        impressions_before_click = self._avg_impressions_before_click(exposure)
+
+        profile = self._assemble(
+            present=present,
+            counts=counts,
+            diversity=diversity,
+            depth=depth,
+            timestamps=timestamps,
+            click_latency=click_latency,
+            skip_latency=skip_latency,
+            first_impression_success=fis,
+            first_impression_success_rate=fis_rate,
+            avg_impressions_before_click=impressions_before_click,
+        )
+        logger.info(
+            "Extracted %d customer profile(s) from %d events.", len(profile), len(work)
+        )
+        return profile
+
+    # -- capability gating (§2/§4) ----------------------------------------
+
+    @staticmethod
+    def _log_capabilities(present: Set[str]) -> None:
+        """Warn about every contract metric the current telemetry cannot yield."""
+        if EVENT_SKIP not in present:
+            logger.warning(
+                "No `skip` telemetry (no label skip-markers found): total_skips, "
+                "skip_rate, avg_time_to_skip_sec, attention_score -> placeholders "
+                "(analytics_contract §4)."
+            )
+        if EVENT_CONVERSION not in present:
+            logger.warning(
+                "No `conversion` telemetry (event_schema §10 future): "
+                "total_conversions, conversion_rate -> placeholders (§4)."
+            )
+        # Metrics that are unavailable regardless of this snapshot — explained
+        # so callers know they are intentionally NOT customer-profile columns.
+        logger.warning(
+            "Unsupported metrics emitted as placeholders / not on customer grain "
+            "(analytics_contract §4): conversion_rate (no conversions); "
+            "loyalty_score (no contract formula defined); fatigue_score (needs "
+            "population min-max norm + temporal CTR decline — Analytics Engine); "
+            "campaign_fatigue_index (campaign grain, needs population); "
+            "engagement_momentum (multi-period grain); segmentation outputs "
+            "segments/primary_segment (need multi-customer population)."
+        )
+
+    # -- component computations (each returns a per-customer frame/series) -
+
+    @staticmethod
+    def _event_counts(work: pd.DataFrame, present: Set[str]) -> pd.DataFrame:
+        """Funnel counts; absent canonical events -> ``pd.NA`` (not 0)."""
+        counts = work.groupby(["customerId", "event"]).size().unstack(fill_value=0)
+        counts = counts.reindex(columns=sorted(CANONICAL_EVENTS), fill_value=0)
+
+        out = pd.DataFrame(index=counts.index)
+        out.index.name = "customerId"
+        out["total_impressions"] = counts[EVENT_IMPRESSION].astype("Int64")
+        out["total_clicks"] = counts[EVENT_CLICK].astype("Int64")
+        out["total_skips"] = (
+            counts[EVENT_SKIP].astype("Int64") if EVENT_SKIP in present else pd.NA
+        )
+        out["total_conversions"] = (
+            counts[EVENT_CONVERSION].astype("Int64")
+            if EVENT_CONVERSION in present
+            else pd.NA
+        )
+        out["repeat_impressions"] = (
+            work.groupby("customerId", sort=False)["is_repeat_impression"]
+            .sum()
+            .astype("Int64")
+        )
+        return out
+
+    @staticmethod
+    def _campaign_diversity(work: pd.DataFrame) -> pd.DataFrame:
+        """Distinct campaigns seen (impressions) and clicked."""
+        seen = (
+            work.loc[work["event"].eq(EVENT_IMPRESSION)]
+            .groupby("customerId", sort=False)["campaign"]
+            .nunique()
+        )
+        clicked = (
+            work.loc[work["event"].eq(EVENT_CLICK)]
+            .groupby("customerId", sort=False)["campaign"]
+            .nunique()
+        )
+        out = pd.DataFrame(index=work["customerId"].drop_duplicates())
+        out.index.name = "customerId"
+        out["unique_campaigns_seen"] = (
+            seen.reindex(out.index).fillna(0).astype("Int64")
+        )
+        out["unique_campaigns_clicked"] = (
+            clicked.reindex(out.index).fillna(0).astype("Int64")
+        )
+        return out
+
+    @classmethod
+    def _session_depth(cls, work: pd.DataFrame) -> pd.Series:
+        """Avg events per distinct session (analytics_contract §3)."""
+        grp = work.groupby("customerId", sort=False)
+        depth = cls._safe_ratio(grp["event"].size(), grp["sessionId"].nunique())
+        depth.name = "avg_session_depth"
+        return depth
+
+    @staticmethod
+    def _event_timestamps(work: pd.DataFrame) -> pd.DataFrame:
+        """first_seen (first impression) and last_seen (latest event), UTC."""
+        impressions = work.loc[work["event"].eq(EVENT_IMPRESSION)]
+        first_ms = impressions.groupby("customerId", sort=False)[
+            "event_timestamp"
+        ].min()
+        last_ms = work.groupby("customerId", sort=False)["event_timestamp"].max()
+
+        out = pd.DataFrame(index=work["customerId"].drop_duplicates())
+        out.index.name = "customerId"
+        out["first_seen"] = pd.to_datetime(
+            first_ms.reindex(out.index), unit="ms", utc=True
+        )
+        out["last_seen"] = pd.to_datetime(
+            last_ms.reindex(out.index), unit="ms", utc=True
+        )
+        return out
+
+    @staticmethod
+    def _reaction_latency(work: pd.DataFrame, reaction: str) -> pd.Series:
+        """Mean seconds from each click/skip to its parent impression (§1.5).
+
+        Backward ``merge_asof`` keyed by ``(customerId, campaign)`` attaches
+        each reaction to the closest preceding impression of the same campaign.
+        Orphans yield NaN and drop out of the mean.
+        """
+        impressions = (
+            work.loc[
+                work["event"].eq(EVENT_IMPRESSION),
+                ["customerId", "campaign", "event_timestamp"],
+            ]
+            .assign(_impression_ts=lambda d: d["event_timestamp"])
+            .sort_values("event_timestamp", kind="stable")
+        )
+        reactions = work.loc[
+            work["event"].eq(reaction),
+            ["customerId", "campaign", "event_timestamp"],
+        ].sort_values("event_timestamp", kind="stable")
+        if reactions.empty or impressions.empty:
+            return pd.Series(dtype="float64")
+
+        merged = pd.merge_asof(
+            reactions,
+            impressions,
+            on="event_timestamp",
+            by=["customerId", "campaign"],
+            direction="backward",
+        )
+        latency_sec = (merged["event_timestamp"] - merged["_impression_ts"]) / 1000.0
+        latency_sec = latency_sec.set_axis(merged["customerId"].to_numpy())
+        return latency_sec.groupby(level=0).mean()
+
+    @staticmethod
+    def _first_click_exposure(work: pd.DataFrame) -> pd.DataFrame:
+        """One row per clicked ``(customerId, campaign)`` describing the FIRST
+        click relative to the campaign's exposures (backs three metrics).
+
+        Columns: customerId, campaign, impressions_at_first_click (>=1),
+        clicked_on_first (bool). Empty when no clicks/impressions to pair.
+        """
+        impressions = work.loc[
+            work["event"].eq(EVENT_IMPRESSION),
+            ["customerId", "campaign", "event_timestamp", "impression_seq"],
+        ].sort_values("event_timestamp", kind="stable")
+        first_clicks = (
+            work.loc[work["event"].eq(EVENT_CLICK)]
+            .sort_values("event_timestamp", kind="stable")
+            .groupby(["customerId", "campaign"], sort=False, as_index=False)
+            .first()[["customerId", "campaign", "event_timestamp"]]
+            .sort_values("event_timestamp", kind="stable")
+        )
+        cols = [
+            "customerId",
+            "campaign",
+            "impressions_at_first_click",
+            "clicked_on_first",
+        ]
+        if first_clicks.empty or impressions.empty:
+            return pd.DataFrame(columns=cols)
+
+        merged = pd.merge_asof(
+            first_clicks,
+            impressions,
+            on="event_timestamp",
+            by=["customerId", "campaign"],
+            direction="backward",
+        )
+        merged = merged.loc[merged["impression_seq"].notna()].copy()  # drop orphans
+        merged["impressions_at_first_click"] = merged["impression_seq"]
+        merged["clicked_on_first"] = merged["impression_seq"].eq(1)
+        return merged[cols]
+
+    @staticmethod
+    def _first_impression_success(exposure: pd.DataFrame) -> pd.Series:
+        """True if the customer clicked ANY campaign on its first exposure."""
+        if exposure.empty:
+            return pd.Series(dtype="boolean")
+        return (
+            exposure.groupby("customerId", sort=False)["clicked_on_first"]
+            .any()
+            .astype("boolean")
+        )
+
+    @staticmethod
+    def _first_impression_success_rate(exposure: pd.DataFrame) -> pd.Series:
+        """Per-customer % of CLICKED campaigns clicked on first exposure (§3 #13)."""
+        if exposure.empty:
+            return pd.Series(dtype="float64")
+        return (
+            exposure.groupby("customerId", sort=False)["clicked_on_first"].mean()
+            * 100.0
+        )
+
+    @staticmethod
+    def _avg_impressions_before_click(exposure: pd.DataFrame) -> pd.Series:
+        """Mean exposures before first click across clicked campaigns (§3 #12)."""
+        if exposure.empty:
+            return pd.Series(dtype="float64")
+        return exposure.groupby("customerId", sort=False)[
+            "impressions_at_first_click"
+        ].mean()
+
+    # -- ratio helper & assembly ------------------------------------------
+
+    @staticmethod
+    def _safe_ratio(
+        numerator: pd.Series, denominator: pd.Series, scale: float = 1.0
+    ) -> pd.Series:
+        """``num / den * scale`` with a zero-denominator guard -> NaN (§8)."""
+        num = numerator.astype("float64")
+        den = denominator.astype("float64")
+        result = np.where(
+            den > 0, num / den.where(den > 0, np.nan) * scale, np.nan
+        )
+        return pd.Series(result, index=numerator.index, dtype="float64")
+
+    def _assemble(
+        self,
+        present: Set[str],
+        counts: pd.DataFrame,
+        diversity: pd.DataFrame,
+        depth: pd.Series,
+        timestamps: pd.DataFrame,
+        click_latency: pd.Series,
+        skip_latency: pd.Series,
+        first_impression_success: pd.Series,
+        first_impression_success_rate: pd.Series,
+        avg_impressions_before_click: pd.Series,
+    ) -> pd.DataFrame:
+        """Join components and derive rate / engagement / exploration metrics."""
+        profile = (
+            counts.join(diversity, how="outer")
+            .join(timestamps, how="left")
+            .join(depth, how="left")
+        )
+        impressions = profile["total_impressions"]
+        clicks = profile["total_clicks"]
+
+        # --- Rate metrics (§3) -------------------------------------------
+        profile["ctr"] = self._safe_ratio(clicks, impressions, scale=100.0)
+        profile["repeat_impression_rate"] = self._safe_ratio(
+            profile["repeat_impressions"], impressions, scale=100.0
+        )
+
+        if EVENT_SKIP in present:
+            profile["skip_rate"] = self._safe_ratio(
+                profile["total_skips"], impressions, scale=100.0
+            )
+            profile["attention_score"] = self._safe_ratio(
+                clicks, clicks + profile["total_skips"]
+            )
+            profile["avg_time_to_skip_sec"] = skip_latency.reindex(profile.index)
+        else:  # §4 placeholder
+            profile["skip_rate"] = np.nan
+            profile["attention_score"] = np.nan
+            profile["avg_time_to_skip_sec"] = np.nan
+
+        if EVENT_CONVERSION in present:
+            profile["conversion_rate"] = self._safe_ratio(
+                profile["total_conversions"], clicks, scale=100.0
+            )
+        else:  # §4 placeholder
+            profile["conversion_rate"] = np.nan
+
+        # --- Time-based ---------------------------------------------------
+        profile["avg_time_to_click_sec"] = click_latency.reindex(profile.index)
+
+        # --- Engagement / exploration ------------------------------------
+        profile["exploration_score"] = self._safe_ratio(
+            profile["unique_campaigns_clicked"], profile["unique_campaigns_seen"]
+        )
+        profile["campaign_diversity_score"] = profile["exploration_score"]  # alias
+        profile["first_impression_success"] = (
+            first_impression_success.reindex(profile.index)
+            .fillna(False)
+            .astype(bool)
+        )
+
+        # --- Extended supported metrics (§3) -----------------------------
+        profile["avg_impressions_before_click"] = (
+            avg_impressions_before_click.reindex(profile.index)
+        )
+        profile["first_impression_success_rate"] = (
+            first_impression_success_rate.reindex(profile.index)
+        )
+        ibc = profile["avg_impressions_before_click"]
+        ttc = profile["avg_time_to_click_sec"]
+        # Comparisons against NaN are False, so non-clickers are never flagged.
+        profile["delayed_responder_flag"] = (
+            (ibc > self.config.delayed_impressions_threshold)
+            | (ttc > self.config.delayed_response_seconds)
+        ).astype(bool)
+
+        # --- §4 placeholders owned by other layers -----------------------
+        profile["fatigue_score"] = np.nan
+        profile["segments"] = [[] for _ in range(len(profile))]
+        profile["primary_segment"] = None
+        profile["profile_updated_at"] = pd.Timestamp.now(tz="UTC")
+
+        return self._finalise(profile)
+
+    @staticmethod
+    def _finalise(profile: pd.DataFrame) -> pd.DataFrame:
+        """Reset index and pin the binding §6 column order."""
+        profile = profile.reset_index()
+        ordered = CustomerProfile.column_order()
+        for col in ordered:
+            if col not in profile.columns:
+                profile[col] = np.nan
+        return profile[ordered]
+
+    @staticmethod
+    def _empty_profile() -> pd.DataFrame:
+        return pd.DataFrame(
+            {c: pd.Series(dtype="object") for c in CustomerProfile.column_order()}
+        )
+
+
+# ===========================================================================
+# Convenience orchestrator
+# ===========================================================================
+
+
+def extract_customer_profiles(
+    path: Union[str, Path],
+    *,
+    classifier_config: Optional[EventClassifierConfig] = None,
+    extractor_config: Optional[FeatureExtractorConfig] = None,
 ) -> pd.DataFrame:
-    """Build per-customer profiles (schema = analytics_contract.md §5).
+    """Load -> classify -> extract in one call (end-to-end convenience).
 
     Parameters
     ----------
-    events:
-        Cleaned telemetry, one row per event. Must contain at least
-        :data:`REQUIRED_COLUMNS`; ``event_timestamp`` is epoch milliseconds.
-    config:
-        Optional :class:`FeatureExtractorConfig`; defaults used when ``None``.
+    path:
+        Path to the raw telemetry export (XLSX-disguised-as-CSV supported).
+    classifier_config, extractor_config:
+        Optional overrides; FROZEN-schema defaults used when ``None``.
 
     Returns
     -------
     pandas.DataFrame
-        One row per customer, columns ordered per
-        :meth:`CustomerProfile.column_order`. Empty (correctly-typed) frame
-        when there are no usable canonical events.
-
-    Raises
-    ------
-    TypeError
-        If ``events`` is not a :class:`pandas.DataFrame`.
-    ValueError
-        If required columns are missing.
+        One row per ``customerId``, columns in binding §6 order.
     """
-    config = config or FeatureExtractorConfig()
-    _validate_input(events, config)
+    raw = TelemetryLoader().load(path)
+    classified = EventClassifier(classifier_config).classify(raw)
+    return FeatureExtractor(extractor_config).extract(classified)
 
-    if events.empty:
-        logger.warning("Received empty events frame; returning empty profile.")
-        return _empty_profile_frame()
 
-    work = _normalise_events(events, config)
-    if work.empty:
-        logger.warning("No canonical behavioural events; returning empty profile.")
-        return _empty_profile_frame()
+# ===========================================================================
+# Example usage
+# ===========================================================================
 
-    present = set(work["event"].unique())
-    _log_capability(present)
+if __name__ == "__main__":  # pragma: no cover
+    import sys
 
-    work = _add_impression_sequence(work)
-
-    counts = _event_counts(work, present)
-    diversity = _campaign_diversity(work)
-    depth = _session_depth(work)
-    timestamps = _event_timestamps(work)
-    click_latency = _pair_reactions_to_impressions(work, EVENT_CLICK)
-    skip_latency = _pair_reactions_to_impressions(work, EVENT_SKIP)
-
-    # First-exposure click analysis is computed ONCE (one as-of join) and reused
-    # for three customer metrics, avoiding duplicate work: the success flag, the
-    # success rate (%), and the avg impressions seen before the first click.
-    exposure = _first_click_exposure(work)
-    fis = _first_impression_success(exposure)
-    fis_rate = _first_impression_success_rate(exposure)
-    impressions_before_click = _avg_impressions_before_click(exposure)
-
-    profile = _assemble_profiles(
-        present=present,
-        counts=counts,
-        diversity=diversity,
-        depth=depth,
-        timestamps=timestamps,
-        click_latency=click_latency,
-        skip_latency=skip_latency,
-        first_impression_success=fis,
-        first_impression_success_rate=fis_rate,
-        avg_impressions_before_click=impressions_before_click,
-        config=config,
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
     )
 
-    logger.info(
-        "Extracted %d customer profiles from %d usable events.",
-        len(profile),
-        len(work),
-    )
-    return profile
-
-
-# ---------------------------------------------------------------------------
-# Validation & capability logging
-# ---------------------------------------------------------------------------
-
-
-def _validate_input(events: pd.DataFrame, config: FeatureExtractorConfig) -> None:
-    """Strict boundary validation with actionable error messages."""
-    if not isinstance(events, pd.DataFrame):
-        raise TypeError(
-            f"`events` must be a pandas DataFrame, got {type(events).__name__}."
-        )
-    required = set(REQUIRED_COLUMNS) | {
-        config.customer_col,
-        config.event_type_col,
-        config.timestamp_col,
-    }
-    missing = sorted(required - set(events.columns))
-    if missing:
-        raise ValueError(
-            f"Input events frame is missing required column(s): {missing}. "
-            f"Present columns: {sorted(events.columns)}."
-        )
-
-
-def _log_capability(present: Set[str]) -> None:
-    """Warn about contract metrics that the current telemetry cannot produce."""
-    if EVENT_SKIP not in present:
-        logger.warning(
-            "No `skip` telemetry present (event_schema.md §6 future extension): "
-            "total_skips, skip_rate, avg_time_to_skip_sec, attention_score and "
-            "fatigue_score will be emitted as placeholders."
-        )
-    if EVENT_CONVERSION not in present:
-        logger.warning(
-            "No `conversion` telemetry present (event_schema.md §6 future "
-            "extension): total_conversions and conversion_rate will be "
-            "emitted as placeholders."
-        )
-
-
-# ---------------------------------------------------------------------------
-# Normalisation
-# ---------------------------------------------------------------------------
-
-
-def _normalise_key(value: object) -> str:
-    """Normalise a raw event name for mapping lookups (lower + strip)."""
-    return str(value).strip().lower()
-
-
-def _normalise_events(
-    events: pd.DataFrame, config: FeatureExtractorConfig
-) -> pd.DataFrame:
-    """Return a tidy working frame restricted to canonical behavioural events.
-
-    Adds ``event`` (canonical), ``campaign`` (from label), ``sessionId`` and a
-    numeric ``event_timestamp`` (ms). Known lifecycle events are dropped
-    quietly; truly unknown raw types are quarantined and counted.
-    """
-    df = events.copy()
-    lookup = {_normalise_key(k): v for k, v in config.event_mapping.items()}
-
-    keys = df[config.event_type_col].map(_normalise_key)
-    df["event"] = keys.map(lookup)
-
-    # --- label-based skip refinement (see FeatureExtractorConfig.action_col) ---
-    # Real telemetry encodes a dismissal as a *click* event whose action label
-    # contains a skip marker (e.g. "Recharge-skip"). Reclassify those to `skip`
-    # so skip metrics are computed from data that genuinely exists, rather than
-    # being treated as engaged clicks.
-    if config.action_col and config.action_col in df.columns and config.skip_label_markers:
-        markers = tuple(m.strip().lower() for m in config.skip_label_markers if m)
-        action_norm = df[config.action_col].map(_normalise_key)
-        looks_skip = action_norm.apply(lambda s: any(m in s for m in markers))
-        reclassified = df["event"].eq(EVENT_CLICK) & looks_skip
-        n_reclass = int(reclassified.sum())
-        if n_reclass:
-            logger.info(
-                "Reclassified %d click event(s) as `skip` via %s marker(s) in `%s`.",
-                n_reclass, list(markers), config.action_col,
-            )
-            df.loc[reclassified, "event"] = EVENT_SKIP
-
-    unmapped = df["event"].isna()
-    if unmapped.any():
-        non_behavioural = unmapped & keys.isin(KNOWN_NON_BEHAVIOURAL)
-        n_known = int(non_behavioural.sum())
-        if n_known:
-            logger.debug("Dropping %d known non-behavioural event(s).", n_known)
-
-        truly_unknown = unmapped & ~keys.isin(KNOWN_NON_BEHAVIOURAL)
-        n_unknown = int(truly_unknown.sum())
-        if n_unknown:
-            sample = (
-                df.loc[truly_unknown, config.event_type_col]
-                .astype(str).value_counts().head(10).to_dict()
-            )
-            logger.warning(
-                "Quarantining %d event(s) with unknown raw types (top: %s).",
-                n_unknown, sample,
-            )
-        df = df.loc[~unmapped].copy()
-
-    if df.empty:
-        return df.iloc[0:0]
-
-    df["customerId"] = df[config.customer_col].astype("string")
-    df["sessionId"] = (
-        df[config.session_col].astype("string")
-        if config.session_col in df.columns
-        else pd.Series(pd.NA, index=df.index, dtype="string")
-    )
-    campaign = (
-        df[config.campaign_col].astype("string")
-        if config.campaign_col in df.columns
-        else pd.Series(pd.NA, index=df.index, dtype="string")
-    )
-    df["campaign"] = campaign.fillna(_UNKNOWN_CAMPAIGN)
-
-    df["event_timestamp"] = pd.to_numeric(df[config.timestamp_col], errors="coerce")
-    bad_ts = int(df["event_timestamp"].isna().sum())
-    if bad_ts:
-        logger.warning(
-            "Dropping %d event(s) with non-numeric `%s`.", bad_ts, config.timestamp_col
-        )
-        df = df.loc[df["event_timestamp"].notna()].copy()
-
-    return df[["customerId", "sessionId", "campaign", "event", "event_timestamp"]]
-
-
-def _add_impression_sequence(work: pd.DataFrame) -> pd.DataFrame:
-    """Add ``impression_seq`` / ``is_repeat_impression`` (analytics §3.2).
-
-    Per ``(customerId, campaign)`` impressions are numbered 1..N chronologically;
-    ``is_repeat_impression`` is True for every exposure after the first.
-    """
-    df = work.sort_values("event_timestamp", kind="stable").copy()
-    is_impression = df["event"].eq(EVENT_IMPRESSION)
-    seq = (
-        df.loc[is_impression]
-        .groupby(["customerId", "campaign"], sort=False)
-        .cumcount()
-        + 1
-    )
-    df["impression_seq"] = seq  # aligns by index; NaN for non-impressions
-    df["is_repeat_impression"] = df["impression_seq"].gt(1).fillna(False)
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Component computations (each returns a per-customer frame/Series)
-# ---------------------------------------------------------------------------
-
-
-def _event_counts(work: pd.DataFrame, present: Set[str]) -> pd.DataFrame:
-    """Event Counts group: impressions, clicks, skips, conversions, repeats.
-
-    Counts for canonical events absent from ``present`` are returned as ``pd.NA``
-    (placeholder), distinguishing "not tracked yet" from a genuine zero.
-    """
-    counts = (
-        work.groupby(["customerId", "event"]).size().unstack(fill_value=0)
-    )
-    counts = counts.reindex(columns=sorted(CANONICAL_EVENTS), fill_value=0)
-
-    out = pd.DataFrame(index=counts.index)
-    out.index.name = "customerId"
-    out["total_impressions"] = counts[EVENT_IMPRESSION].astype("Int64")
-    out["total_clicks"] = counts[EVENT_CLICK].astype("Int64")
-    out["total_skips"] = (
-        counts[EVENT_SKIP].astype("Int64") if EVENT_SKIP in present else pd.NA
-    )
-    out["total_conversions"] = (
-        counts[EVENT_CONVERSION].astype("Int64") if EVENT_CONVERSION in present else pd.NA
-    )
-    out["repeat_impressions"] = (
-        work.groupby("customerId", sort=False)["is_repeat_impression"]
-        .sum().astype("Int64")
-    )
-    return out
-
-
-def _campaign_diversity(work: pd.DataFrame) -> pd.DataFrame:
-    """Exploration Counts: distinct campaigns seen and clicked."""
-    seen = (
-        work.loc[work["event"].eq(EVENT_IMPRESSION)]
-        .groupby("customerId", sort=False)["campaign"].nunique()
-    )
-    clicked = (
-        work.loc[work["event"].eq(EVENT_CLICK)]
-        .groupby("customerId", sort=False)["campaign"].nunique()
-    )
-    out = pd.DataFrame(index=work["customerId"].drop_duplicates())
-    out.index.name = "customerId"
-    out["unique_campaigns_seen"] = seen.reindex(out.index).fillna(0).astype("Int64")
-    out["unique_campaigns_clicked"] = (
-        clicked.reindex(out.index).fillna(0).astype("Int64")
-    )
-    return out
-
-
-def _session_depth(work: pd.DataFrame) -> pd.Series:
-    """Avg session depth (§7.7): canonical events per distinct session."""
-    grp = work.groupby("customerId", sort=False)
-    n_events = grp["event"].size()
-    n_sessions = grp["sessionId"].nunique()
-    depth = _safe_ratio(n_events, n_sessions)
-    depth.name = "avg_session_depth"
-    return depth
-
-
-def _event_timestamps(work: pd.DataFrame) -> pd.DataFrame:
-    """first_seen (first impression) and last_seen (latest event), UTC (§13)."""
-    impressions = work.loc[work["event"].eq(EVENT_IMPRESSION)]
-    first_ms = impressions.groupby("customerId", sort=False)["event_timestamp"].min()
-    last_ms = work.groupby("customerId", sort=False)["event_timestamp"].max()
-
-    out = pd.DataFrame(index=work["customerId"].drop_duplicates())
-    out.index.name = "customerId"
-    out["first_seen"] = pd.to_datetime(
-        first_ms.reindex(out.index), unit="ms", utc=True
-    )
-    out["last_seen"] = pd.to_datetime(
-        last_ms.reindex(out.index), unit="ms", utc=True
-    )
-    return out
-
-
-def _pair_reactions_to_impressions(
-    work: pd.DataFrame, reaction_event: str
-) -> pd.Series:
-    """Mean latency (seconds) from each reaction to its parent impression.
-
-    ``merge_asof`` (backward) keyed by ``(customerId, campaign)`` attaches each
-    click/skip to the closest preceding impression of the same campaign
-    (analytics §3.2 parent rule). Orphan reactions yield ``NaN`` and drop out of
-    the mean. Returns a per-customer Series; empty when the reaction is absent.
-    """
-    impressions = (
-        work.loc[
-            work["event"].eq(EVENT_IMPRESSION),
-            ["customerId", "campaign", "event_timestamp"],
-        ]
-        .assign(_impression_ts=lambda d: d["event_timestamp"])
-        .sort_values("event_timestamp", kind="stable")
-    )
-    reactions = (
-        work.loc[
-            work["event"].eq(reaction_event),
-            ["customerId", "campaign", "event_timestamp"],
-        ].sort_values("event_timestamp", kind="stable")
-    )
-    if reactions.empty or impressions.empty:
-        return pd.Series(dtype="float64")
-
-    merged = pd.merge_asof(
-        reactions, impressions,
-        on="event_timestamp", by=["customerId", "campaign"], direction="backward",
-    )
-    latency_sec = (merged["event_timestamp"] - merged["_impression_ts"]) / 1000.0
-    latency_sec = latency_sec.set_axis(merged["customerId"].to_numpy())
-    return latency_sec.groupby(level=0).mean()
-
-
-def _first_click_exposure(work: pd.DataFrame) -> pd.DataFrame:
-    """One row per ``(customerId, campaign)`` the customer clicked, describing
-    that customer's FIRST click on the campaign relative to its exposures.
-
-    For every clicked campaign we take the earliest click in time and match it
-    (backward as-of join) to the parent impression in effect at that instant
-    (analytics_contract.md §3.2 "parent impression" rule). The matched
-    ``impression_seq`` is how many times the campaign had been shown up to and
-    including that click.
-
-    Returned columns
-    ----------------
-    customerId, campaign,
-    impressions_at_first_click : int  -- exposure count when first clicked (>=1)
-    clicked_on_first           : bool -- True iff first click landed on exposure #1
-
-    This single computation backs three customer metrics
-    (:func:`_first_impression_success`, :func:`_first_impression_success_rate`,
-    :func:`_avg_impressions_before_click`), so the as-of join runs only once.
-    Returns an empty frame when there are no clicks/impressions to pair.
-    """
-    # Impressions carry their per-(customer, campaign) sequence number.
-    impressions = (
-        work.loc[
-            work["event"].eq(EVENT_IMPRESSION),
-            ["customerId", "campaign", "event_timestamp", "impression_seq"],
-        ].sort_values("event_timestamp", kind="stable")
-    )
-    # Earliest click per (customer, campaign) == the customer's "first reaction".
-    first_clicks = (
-        work.loc[work["event"].eq(EVENT_CLICK)]
-        .sort_values("event_timestamp", kind="stable")
-        .groupby(["customerId", "campaign"], sort=False, as_index=False)
-        .first()[["customerId", "campaign", "event_timestamp"]]
-        .sort_values("event_timestamp", kind="stable")
-    )
-    if first_clicks.empty or impressions.empty:
-        return pd.DataFrame(
-            columns=[
-                "customerId",
-                "campaign",
-                "impressions_at_first_click",
-                "clicked_on_first",
-            ]
-        )
-
-    # Backward as-of join: nearest impression at-or-before each first click.
-    merged = pd.merge_asof(
-        first_clicks, impressions,
-        on="event_timestamp", by=["customerId", "campaign"], direction="backward",
-    )
-    # Drop orphan clicks (no preceding impression) -- they carry no exposure signal.
-    merged = merged.loc[merged["impression_seq"].notna()].copy()
-    merged["impressions_at_first_click"] = merged["impression_seq"]
-    merged["clicked_on_first"] = merged["impression_seq"].eq(1)
-    return merged[
-        ["customerId", "campaign", "impressions_at_first_click", "clicked_on_first"]
-    ]
-
-
-def _first_impression_success(exposure: pd.DataFrame) -> pd.Series:
-    """first_impression_success (§5): clicked >=1 campaign on its first exposure.
-
-    Per-customer reduction of :func:`_first_click_exposure`: True if ANY clicked
-    campaign was clicked on exposure #1. Non-clickers are absent here and are
-    filled ``False`` during assembly.
-    """
-    if exposure.empty:
-        return pd.Series(dtype="boolean")
-    # .any() over the per-campaign boolean -> "succeeded at least once".
-    return (
-        exposure.groupby("customerId", sort=False)["clicked_on_first"]
-        .any().astype("boolean")
-    )
-
-
-def _first_impression_success_rate(exposure: pd.DataFrame) -> pd.Series:
-    """first_impression_success_rate: share of a customer's CLICKED campaigns that
-    were clicked on first exposure, as a 0-100 percentage.
-
-    Per-customer analogue of analytics_contract.md §8.5 (which is a population
-    rate across users). It grades the boolean ``first_impression_success`` -- e.g.
-    clicked 4 campaigns, 3 of them on first sight -> 75.0. A customer with no
-    clicked campaigns has a zero denominator -> ``NaN`` (§13 convention).
-    """
-    if exposure.empty:
-        return pd.Series(dtype="float64")
-    # mean() of a boolean column == fraction True; *100 -> percentage.
-    return (
-        exposure.groupby("customerId", sort=False)["clicked_on_first"].mean()
-        * 100.0
-    )
-
-
-def _avg_impressions_before_click(exposure: pd.DataFrame) -> pd.Series:
-    """Average number of impressions seen before the first click, per customer.
-
-    Mean of ``impressions_at_first_click`` across the customer's clicked
-    campaigns. Feeds ``delayed_responder_flag``. ``NaN`` for non-clickers.
-    """
-    if exposure.empty:
-        return pd.Series(dtype="float64")
-    return (
-        exposure.groupby("customerId", sort=False)["impressions_at_first_click"]
-        .mean()
-    )
-
-
-# ---------------------------------------------------------------------------
-# Ratio helper & assembly
-# ---------------------------------------------------------------------------
-
-
-def _safe_ratio(
-    numerator: pd.Series, denominator: pd.Series, scale: float = 1.0
-) -> pd.Series:
-    """``numerator / denominator * scale`` with a zero-denominator guard (§13).
-
-    Returns ``NaN`` where the denominator is 0/NaN so such customers are
-    excluded from downstream rollups rather than skewed toward zero.
-    """
-    num = numerator.astype("float64")
-    den = denominator.astype("float64")
-    result = np.where(den > 0, num / den.where(den > 0, np.nan) * scale, np.nan)
-    return pd.Series(result, index=numerator.index, dtype="float64")
-
-
-def _assemble_profiles(
-    present: Set[str],
-    counts: pd.DataFrame,
-    diversity: pd.DataFrame,
-    depth: pd.Series,
-    timestamps: pd.DataFrame,
-    click_latency: pd.Series,
-    skip_latency: pd.Series,
-    first_impression_success: pd.Series,
-    first_impression_success_rate: pd.Series,
-    avg_impressions_before_click: pd.Series,
-    config: FeatureExtractorConfig,
-) -> pd.DataFrame:
-    """Join components and derive rate / engagement / exploration metrics."""
-    profile = (
-        counts.join(diversity, how="outer")
-        .join(timestamps, how="left")
-        .join(depth, how="left")
-    )
-
-    impressions = profile["total_impressions"]
-    clicks = profile["total_clicks"]
-
-    # --- Rate Metrics -----------------------------------------------------
-    profile["ctr"] = _safe_ratio(clicks, impressions, scale=100.0)
-    profile["repeat_impression_rate"] = _safe_ratio(
-        profile["repeat_impressions"], impressions, scale=100.0
-    )
-    if EVENT_SKIP in present:
-        profile["skip_rate"] = _safe_ratio(
-            profile["total_skips"], impressions, scale=100.0
-        )
-        profile["attention_score"] = _safe_ratio(
-            clicks, clicks + profile["total_skips"]
-        )
-        profile["avg_time_to_skip_sec"] = skip_latency.reindex(profile.index)
-    else:  # TODO: §6 future skip telemetry
-        profile["skip_rate"] = np.nan
-        profile["attention_score"] = np.nan
-        profile["avg_time_to_skip_sec"] = np.nan
-
-    if EVENT_CONVERSION in present:
-        profile["conversion_rate"] = _safe_ratio(
-            profile["total_conversions"], clicks, scale=100.0
-        )
-    else:  # TODO: §6 future conversion telemetry
-        profile["conversion_rate"] = np.nan
-
-    # --- Time-Based -------------------------------------------------------
-    profile["avg_time_to_click_sec"] = click_latency.reindex(profile.index)
-
-    # --- Engagement / Exploration ----------------------------------------
-    profile["exploration_score"] = _safe_ratio(
-        profile["unique_campaigns_clicked"], profile["unique_campaigns_seen"]
-    )
-    profile["first_impression_success"] = (
-        first_impression_success.reindex(profile.index).fillna(False).astype(bool)
-    )
-
-    # --- Extended derived metrics (targeted additions) -------------------
-    # campaign_diversity_score = unique_campaigns_clicked / unique_campaigns_seen.
-    # NOTE: by formula this is IDENTICAL to exploration_score (§8.8); it is
-    # exposed under the requested business-friendly name. Both are retained so
-    # neither the existing nor the newly-requested column is removed.
-    profile["campaign_diversity_score"] = _safe_ratio(
-        profile["unique_campaigns_clicked"], profile["unique_campaigns_seen"]
-    )
-
-    # Mean exposures before first click (over clicked campaigns); NaN if never
-    # clicked. Reindexed onto the full customer set.
-    profile["avg_impressions_before_click"] = avg_impressions_before_click.reindex(
-        profile.index
-    )
-
-    # % of clicked campaigns clicked on first exposure; NaN for non-clickers.
-    profile["first_impression_success_rate"] = first_impression_success_rate.reindex(
-        profile.index
-    )
-
-    # delayed_responder_flag: the customer engages slowly -- either needs more
-    # than ``delayed_impressions_threshold`` exposures before clicking, OR takes
-    # longer than ``delayed_response_seconds`` to click on average. Comparisons
-    # against NaN evaluate to False, so non-clickers are never flagged.
-    ibc = profile["avg_impressions_before_click"]
-    ttc = profile["avg_time_to_click_sec"]
-    profile["delayed_responder_flag"] = (
-        (ibc > config.delayed_impressions_threshold)
-        | (ttc > config.delayed_response_seconds)
-    ).astype(bool)
-
-    # --- TODO placeholders (owned by other layers) -----------------------
-    profile["fatigue_score"] = np.nan       # §7.8: needs skip + temporal ctr_decline
-    profile["segments"] = [[] for _ in range(len(profile))]  # §9 segmentation step
-    profile["primary_segment"] = None       # §9 segmentation step
-    profile["profile_updated_at"] = pd.Timestamp.now(tz="UTC")
-
-    return _finalise_columns(profile)
-
-
-def _finalise_columns(profile: pd.DataFrame) -> pd.DataFrame:
-    """Reset index and pin the §5 column order."""
-    profile = profile.reset_index()
-    ordered = CustomerProfile.column_order()
-    for col in ordered:
-        if col not in profile.columns:
-            profile[col] = np.nan
-    return profile[ordered]
-
-
-def _empty_profile_frame() -> pd.DataFrame:
-    """Empty profile frame carrying the full §5 column schema."""
-    return pd.DataFrame(
-        {c: pd.Series(dtype="object") for c in CustomerProfile.column_order()}
-    )
+    sample = sys.argv[1] if len(sys.argv) > 1 else "sample_data/telemetry_sample.csv"
+
+    # End-to-end:
+    profiles = extract_customer_profiles(sample)
+
+    # …or step-by-step (each stage is independently unit-testable):
+    #   raw        = TelemetryLoader().load(sample)
+    #   classified = EventClassifier().classify(raw)
+    #   profiles   = FeatureExtractor().extract(classified)
+
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", 200)
+    print(f"\nCustomer profiles: {profiles.shape[0]} row(s) x {profiles.shape[1]} cols")
+    print(profiles.to_string(index=False))
