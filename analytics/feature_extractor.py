@@ -59,18 +59,23 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Mapping, Optional, Set, Union
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Set, Union
 
 import numpy as np
 import pandas as pd
+import yaml
 
 __all__ = [
     "TelemetryLoader",
+    "SemanticSchema",
+    "load_semantic_schema",
     "EventClassifier",
     "EventClassifierConfig",
     "FeatureExtractor",
     "FeatureExtractorConfig",
     "CustomerProfile",
+    "MetricCalculator",
+    "MetricResult",
     "extract_customer_profiles",
 ]
 
@@ -164,6 +169,97 @@ _CLASSIFIED_COLUMNS = [
     "is_repeat_impression",
 ]
 
+#: Default location of the semantic mapping config (relative to project root).
+_DEFAULT_SEMANTIC_MAPPINGS = (
+    Path(__file__).resolve().parents[1] / "configs" / "semantic_mappings.yaml"
+)
+
+
+def _norm_key(value: object) -> str:
+    """Normalise a raw token for case-insensitive lookups."""
+    return str(value).strip().lower()
+
+
+def _safe_div(
+    numerator: object, denominator: object, scale: float = 1.0
+) -> pd.Series:
+    """``num / den * scale`` with a zero/NaN-denominator guard -> NaN."""
+    num = pd.Series(numerator, dtype="float64")
+    den = pd.Series(denominator, dtype="float64").reindex(num.index)
+    result = np.where(den > 0, num / den.where(den > 0, np.nan) * scale, np.nan)
+    return pd.Series(result, index=num.index, dtype="float64")
+
+
+# ===========================================================================
+# Semantic schema  (Task 4 — domain-agnostic role <-> column registry)
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class SemanticSchema:
+    """Resolves canonical *roles* to a dataset's physical columns & events.
+
+    Loaded from ``configs/semantic_mappings.yaml`` (see
+    :func:`load_semantic_schema`). The analytics layers reference roles
+    (``customer_id``, ``campaign``, ``event_type`` …) so a new domain is
+    onboarded by adding a YAML block — no code change.
+    """
+
+    dataset: str
+    columns: Mapping[str, str]
+    event_roles: Mapping[str, str]
+    skip_markers: FrozenSet[str] = frozenset({"skip", "dismiss"})
+    interaction_roles: FrozenSet[str] = frozenset({"click", "skip"})
+    exposure_roles: FrozenSet[str] = frozenset({"impression"})
+    timestamp_unit: str = "ms"
+
+    def col(self, role: str) -> Optional[str]:
+        """Physical column for ``role`` (or ``None`` if unmapped)."""
+        return self.columns.get(role)
+
+    def require(self, role: str) -> str:
+        """Physical column for ``role``; raise if the role is not mapped."""
+        column = self.col(role)
+        if not column:
+            raise KeyError(
+                f"Semantic role '{role}' is not mapped for dataset "
+                f"'{self.dataset}'. Add it to configs/semantic_mappings.yaml."
+            )
+        return column
+
+
+def load_semantic_schema(
+    path: Union[str, Path] = _DEFAULT_SEMANTIC_MAPPINGS,
+    dataset: Optional[str] = None,
+) -> SemanticSchema:
+    """Load a :class:`SemanticSchema` for ``dataset`` (default: file default)."""
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh) or {}
+
+    dataset = dataset or doc.get("default_dataset")
+    blocks = doc.get("datasets", {})
+    if dataset not in blocks:
+        raise KeyError(
+            f"Dataset '{dataset}' not found in {path}. "
+            f"Available: {sorted(blocks)}."
+        )
+    block = blocks[dataset]
+    return SemanticSchema(
+        dataset=dataset,
+        columns=dict(block["columns"]),
+        event_roles={
+            _norm_key(k): str(v)
+            for k, v in (block.get("event_roles") or {}).items()
+        },
+        skip_markers=frozenset(
+            _norm_key(m) for m in (block.get("skip_markers") or ["skip", "dismiss"])
+        ),
+        interaction_roles=frozenset(block.get("interaction_roles") or ["click", "skip"]),
+        exposure_roles=frozenset(block.get("exposure_roles") or ["impression"]),
+        timestamp_unit=str(block.get("timestamp_unit", "ms")),
+    )
+
 
 # ===========================================================================
 # 1. TelemetryLoader  (Ingestion Layer — event_schema.md §1)
@@ -255,6 +351,32 @@ class EventClassifierConfig:
     event_mapping: Mapping[str, str] = field(
         default_factory=lambda: dict(DEFAULT_EVENT_MAPPING)
     )
+
+    @classmethod
+    def from_schema(cls, schema: "SemanticSchema") -> "EventClassifierConfig":
+        """Build a config from a :class:`SemanticSchema` (Task 4 wiring).
+
+        Only ``impression`` / ``click`` / ``conversion`` event roles flow into
+        the behavioural mapping; ``skip`` is derived from the action label, and
+        infrastructure roles (served/received/saved/other) are ignored by the
+        contract classifier.
+        """
+        behavioural = {EVENT_IMPRESSION, EVENT_CLICK, EVENT_CONVERSION}
+        mapping = {
+            raw: role
+            for raw, role in schema.event_roles.items()
+            if role in behavioural
+        }
+        return cls(
+            customer_col=schema.require("customer_id"),
+            session_col=schema.col("session_id") or "sessionId",
+            event_type_col=schema.require("event_type"),
+            timestamp_col=schema.require("timestamp"),
+            campaign_col=schema.col("campaign") or "click_action",
+            action_col=schema.col("action") or "label",
+            skip_markers=schema.skip_markers,
+            event_mapping=mapping or dict(DEFAULT_EVENT_MAPPING),
+        )
 
 
 class EventClassifier:
@@ -507,7 +629,11 @@ class CustomerProfile:
     fatigue_score: float = np.nan
 
     # --- Engagement ------------------------------------------------------
-    attention_score: float = np.nan   # label-derived (§3)
+    # NOTE: despite the contract name, `attention_score` is a behavioural
+    # REACTION RATIO = clicks / (clicks + skips). It measures the share of
+    # reactions that were clicks; it is NOT a psychological "attention"/dwell
+    # signal (the telemetry cannot observe attention). Label-derived via skips.
+    attention_score: float = np.nan
     first_impression_success: bool = False
 
     # --- Exploration -----------------------------------------------------
@@ -539,13 +665,28 @@ class CustomerProfile:
 
 @dataclass(frozen=True)
 class FeatureExtractorConfig:
-    """Config-driven thresholds (analytics_contract §3 #14 / §8).
+    """Config-driven thresholds & capability switches (analytics_contract §3/§8).
 
-    A customer is a "delayed responder" if they typically need more than
-    ``delayed_impressions_threshold`` exposures before clicking, OR take longer
-    than ``delayed_response_seconds`` to click on average.
+    Attributes
+    ----------
+    compute_latency_metrics:
+        When True, compute ``avg_time_to_click_sec`` / ``avg_time_to_skip_sec``
+        — the elapsed time between the impression log and the reaction log.
+        This is a measured *event-gap latency*, NOT dwell/attention/read time
+        (which the telemetry cannot observe). Disable to avoid surfacing a value
+        that is easily mis-read as an attention signal.
+    compute_behavioural_flags:
+        When True, emit ``delayed_responder_flag``. This is a threshold-derived
+        *label* (``impressions_before_click`` / ``time_to_click`` over a cutoff).
+        It is OFF by default: such interpretation belongs in the scores /
+        observations layer (composite, explainable), not as a fact column on the
+        profile. When off, the flag is emitted as ``False`` and a note is logged.
+    delayed_response_seconds, delayed_impressions_threshold:
+        Cutoffs backing ``delayed_responder_flag`` when it is enabled.
     """
 
+    compute_latency_metrics: bool = True
+    compute_behavioural_flags: bool = False
     delayed_response_seconds: float = 60.0
     delayed_impressions_threshold: int = 3
 
@@ -581,8 +722,16 @@ class FeatureExtractor:
         diversity = self._campaign_diversity(work)
         depth = self._session_depth(work)
         timestamps = self._event_timestamps(work)
-        click_latency = self._reaction_latency(work, EVENT_CLICK)
-        skip_latency = self._reaction_latency(work, EVENT_SKIP)
+        if self.config.compute_latency_metrics:
+            click_latency = self._reaction_latency(work, EVENT_CLICK)
+            skip_latency = self._reaction_latency(work, EVENT_SKIP)
+        else:
+            logger.info(
+                "Latency metrics disabled (avg_time_to_click_sec / "
+                "avg_time_to_skip_sec emitted as NaN)."
+            )
+            click_latency = pd.Series(dtype="float64")
+            skip_latency = pd.Series(dtype="float64")
 
         # First-exposure analysis computed ONCE, reused by three metrics.
         exposure = self._first_click_exposure(work)
@@ -899,13 +1048,23 @@ class FeatureExtractor:
         profile["first_impression_success_rate"] = (
             first_impression_success_rate.reindex(profile.index)
         )
-        ibc = profile["avg_impressions_before_click"]
-        ttc = profile["avg_time_to_click_sec"]
-        # Comparisons against NaN are False, so non-clickers are never flagged.
-        profile["delayed_responder_flag"] = (
-            (ibc > self.config.delayed_impressions_threshold)
-            | (ttc > self.config.delayed_response_seconds)
-        ).astype(bool)
+        # delayed_responder_flag is a threshold-derived behavioural *label*. It
+        # is OFF by default — interpretation belongs in the scores/observations
+        # layer, not as a fact column (see FeatureExtractorConfig). When enabled,
+        # comparisons against NaN are False, so non-clickers are never flagged.
+        if self.config.compute_behavioural_flags:
+            ibc = profile["avg_impressions_before_click"]
+            ttc = profile["avg_time_to_click_sec"]
+            profile["delayed_responder_flag"] = (
+                (ibc > self.config.delayed_impressions_threshold)
+                | (ttc > self.config.delayed_response_seconds)
+            ).astype(bool)
+        else:
+            logger.info(
+                "Behavioural labelling disabled (delayed_responder_flag=False); "
+                "use the scores/observations layer for interpretation."
+            )
+            profile["delayed_responder_flag"] = False
 
         # --- §4 placeholders owned by other layers -----------------------
         profile["fatigue_score"] = np.nan
@@ -930,6 +1089,387 @@ class FeatureExtractor:
         return pd.DataFrame(
             {c: pd.Series(dtype="object") for c in CustomerProfile.column_order()}
         )
+
+
+# ===========================================================================
+# MetricCalculator  (Task 1 — generic, directly-calculable metrics)
+# ===========================================================================
+
+#: Per-customer numeric metrics summarised into the dataset averages. These are
+#: ALL directly calculable from logged events — no dwell/attention/intent.
+GENERIC_NUMERIC_METRICS: tuple = (
+    "event_count",
+    "impression_count",
+    "click_count",
+    "skip_count",
+    "campaign_served_count",
+    "campaign_received_count",
+    "session_count",
+    "unique_campaign_count",
+    "unique_screen_count",
+    "ctr",
+    "click_rate",
+    "exposure_frequency",
+    "interaction_frequency",
+    "average_events_per_session",
+    "campaign_diversity",
+    "repeat_interaction_rate",
+)
+
+#: Subset of :data:`GENERIC_NUMERIC_METRICS` that are integer counts (the rest
+#: are float rates). Used when emitting capability-gated ``<NA>`` placeholders.
+_GENERIC_INT_METRICS: FrozenSet[str] = frozenset(
+    {
+        "event_count",
+        "impression_count",
+        "click_count",
+        "skip_count",
+        "campaign_served_count",
+        "campaign_received_count",
+        "session_count",
+        "unique_campaign_count",
+        "unique_screen_count",
+    }
+)
+
+
+@dataclass
+class MetricResult:
+    """Output of :class:`MetricCalculator`.
+
+    Attributes
+    ----------
+    customer_metrics:
+        One row per customer; columns are :data:`GENERIC_NUMERIC_METRICS` plus
+        ``customerId``, ``campaigns_reached`` and an ``event_distribution`` dict.
+    dataset_summary:
+        Population-level aggregates: counts, global ``event_distribution``,
+        ``campaign_reach`` (campaign -> distinct customers) and
+        ``metric_averages`` (mean of each numeric metric) for comparisons.
+    """
+
+    customer_metrics: pd.DataFrame
+    dataset_summary: Dict[str, Any]
+
+
+class MetricCalculator:
+    """Compute directly-calculable, domain-agnostic metrics over raw telemetry.
+
+    Unlike :class:`FeatureExtractor` (which produces the floater-contract §6
+    profile from the behavioural funnel only), this operates on **all** events
+    via the :class:`SemanticSchema`, so it generalises to any domain. It emits
+    only evidence-grounded metrics (counts, ratios, frequencies, diversity,
+    distribution) and never infers attention, dwell, intent or journeys.
+    """
+
+    def __init__(self, schema: Optional[SemanticSchema] = None) -> None:
+        self.schema = schema or load_semantic_schema()
+
+    # -- public API --------------------------------------------------------
+
+    def compute(self, raw: pd.DataFrame) -> MetricResult:
+        """Return per-customer metrics and a dataset summary for ``raw``."""
+        if not isinstance(raw, pd.DataFrame):
+            raise TypeError(
+                f"`raw` must be a pandas DataFrame, got {type(raw).__name__}."
+            )
+        work = self._normalise(raw)
+        if work.empty:
+            logger.warning("No usable rows for metric calculation.")
+            return MetricResult(self._empty_metrics(), self._empty_summary())
+
+        customer_metrics = self._per_customer(work)
+        dataset_summary = self._summary(work, customer_metrics)
+        logger.info(
+            "Computed generic metrics for %d customer(s) over %d events.",
+            len(customer_metrics),
+            len(work),
+        )
+        unavailable = dataset_summary.get("unavailable_metrics", [])
+        if unavailable:
+            logger.warning(
+                "Schema '%s' does not support %d metric(s): %s. They are emitted "
+                "as <NA> (not 0). Map the missing role/column in "
+                "configs/semantic_mappings.yaml to enable them.",
+                self.schema.dataset,
+                len(unavailable),
+                unavailable,
+            )
+        return MetricResult(customer_metrics, dataset_summary)
+
+    # -- capability gating -------------------------------------------------
+
+    def _capabilities(self) -> Dict[str, bool]:
+        """Which metric inputs the active schema can actually supply.
+
+        Capability is a property of the **schema**, not the data: if a role or
+        column is not mapped, the corresponding metric is *unavailable* (emitted
+        as ``<NA>``) rather than a misleading ``0``.
+        """
+        s = self.schema
+        roles = set(s.event_roles.values())
+        return {
+            "impression": "impression" in roles,
+            "click": "click" in roles,
+            # skip is derivable from a native skip role OR from click+markers.
+            "skip": ("skip" in roles) or (bool(s.skip_markers) and "click" in roles),
+            "served": "campaign_served" in roles,
+            "received": "campaign_received" in roles,
+            "session": s.col("session_id") is not None,
+            "campaign": s.col("campaign") is not None,
+            "screen": s.col("screen") is not None,
+            "timestamp": s.col("timestamp") is not None,
+        }
+
+    @staticmethod
+    def _metric_gates(caps: Mapping[str, bool]) -> Dict[str, bool]:
+        """Map each generic metric to whether its inputs are available."""
+        return {
+            "event_count": True,
+            "impression_count": caps["impression"],
+            "click_count": caps["click"],
+            "skip_count": caps["skip"],
+            "campaign_served_count": caps["served"],
+            "campaign_received_count": caps["received"],
+            "session_count": caps["session"],
+            "unique_campaign_count": caps["campaign"],
+            "unique_screen_count": caps["screen"],
+            "ctr": caps["click"] and caps["impression"],
+            "click_rate": caps["click"],
+            "exposure_frequency": caps["impression"] and caps["session"],
+            "interaction_frequency": (caps["click"] or caps["skip"]) and caps["session"],
+            "average_events_per_session": caps["session"],
+            "campaign_diversity": caps["campaign"],
+            "repeat_interaction_rate": (
+                caps["impression"] and caps["campaign"] and caps["timestamp"]
+            ),
+        }
+
+    # -- normalisation -----------------------------------------------------
+
+    def _normalise(self, raw: pd.DataFrame) -> pd.DataFrame:
+        """Project raw telemetry onto canonical role columns (schema-driven)."""
+        s = self.schema
+        out = pd.DataFrame(index=raw.index)
+        out["customerId"] = raw[s.require("customer_id")].astype("string")
+
+        roles = raw[s.require("event_type")].map(_norm_key).map(s.event_roles)
+        out["role"] = roles.fillna("other")
+
+        # A click whose action label marks a dismissal is a skip (schema rule).
+        action_col = s.col("action")
+        if action_col and action_col in raw.columns and s.skip_markers:
+            markers = tuple(s.skip_markers)
+            action = raw[action_col].map(_norm_key)
+            looks_skip = action.apply(lambda a: any(m in a for m in markers))
+            out.loc[out["role"].eq("click") & looks_skip, "role"] = "skip"
+
+        session_col = s.col("session_id")
+        out["sessionId"] = (
+            raw[session_col].astype("string")
+            if session_col and session_col in raw.columns
+            else pd.Series(pd.NA, index=raw.index, dtype="string")
+        )
+        campaign_col = s.col("campaign")
+        out["campaign"] = (
+            raw[campaign_col].astype("string")
+            if campaign_col and campaign_col in raw.columns
+            else pd.Series(pd.NA, index=raw.index, dtype="string")
+        )
+        screen_col = s.col("screen")
+        out["screen"] = (
+            raw[screen_col].astype("string")
+            if screen_col and screen_col in raw.columns
+            else pd.Series(pd.NA, index=raw.index, dtype="string")
+        )
+        ts_col = s.col("timestamp")
+        out["ts"] = (
+            pd.to_numeric(raw[ts_col], errors="coerce")
+            if ts_col and ts_col in raw.columns
+            else np.nan
+        )
+        return out.loc[out["customerId"].notna()].copy()
+
+    # -- per-customer metrics ---------------------------------------------
+
+    def _per_customer(self, work: pd.DataFrame) -> pd.DataFrame:
+        g = work.groupby("customerId", sort=True)
+        index = pd.Index(sorted(work["customerId"].dropna().unique()), name="customerId")
+        out = pd.DataFrame(index=index)
+
+        def role_count(role: str) -> pd.Series:
+            return (
+                work.loc[work["role"].eq(role)]
+                .groupby("customerId")
+                .size()
+                .reindex(index)
+                .fillna(0)
+                .astype("Int64")
+            )
+
+        out["event_count"] = g.size().reindex(index).fillna(0).astype("Int64")
+        out["impression_count"] = role_count("impression")
+        out["click_count"] = role_count("click")
+        out["skip_count"] = role_count("skip")
+        out["campaign_served_count"] = role_count("campaign_served")
+        out["campaign_received_count"] = role_count("campaign_received")
+        out["session_count"] = (
+            g["sessionId"].nunique().reindex(index).fillna(0).astype("Int64")
+        )
+
+        # Campaign attribution requires a campaign-related event: `click_action`
+        # is overloaded (it carries navigation actions / ids on `other` rows),
+        # so only recognised roles contribute to campaign metrics.
+        campaign_events = work.loc[work["campaign"].notna() & work["role"].ne("other")]
+        out["unique_campaign_count"] = (
+            campaign_events.groupby("customerId")["campaign"]
+            .nunique()
+            .reindex(index)
+            .fillna(0)
+            .astype("Int64")
+        )
+        out["unique_screen_count"] = (
+            work.loc[work["screen"].notna()]
+            .groupby("customerId")["screen"]
+            .nunique()
+            .reindex(index)
+            .fillna(0)
+            .astype("Int64")
+        )
+
+        impressions = out["impression_count"].astype("float64")
+        clicks = out["click_count"].astype("float64")
+        skips = out["skip_count"].astype("float64")
+        events = out["event_count"].astype("float64")
+        sessions = out["session_count"].astype("float64")
+        campaign_bearing = (
+            campaign_events.groupby("customerId")
+            .size()
+            .reindex(index)
+            .fillna(0)
+            .astype("float64")
+        )
+
+        out["ctr"] = _safe_div(clicks, impressions, scale=100.0)
+        out["click_rate"] = _safe_div(clicks, events)               # share 0..1
+        out["exposure_frequency"] = _safe_div(impressions, sessions)
+        out["interaction_frequency"] = _safe_div(clicks + skips, sessions)
+        out["average_events_per_session"] = _safe_div(events, sessions)
+        out["campaign_diversity"] = _safe_div(
+            out["unique_campaign_count"].astype("float64"), campaign_bearing
+        )
+        out["repeat_interaction_rate"] = _safe_div(
+            self._repeat_impression_counts(work).reindex(index).fillna(0),
+            impressions,
+            scale=100.0,
+        )
+
+        # --- capability gating ------------------------------------------------
+        # A metric the active schema cannot support is emitted as <NA>/NaN, never
+        # a misleading 0. This keeps the calculator correct today and lets future
+        # datasets enable metrics simply by mapping more roles/columns in YAML.
+        gates = self._metric_gates(self._capabilities())
+        n = len(index)
+        for metric, supported in gates.items():
+            if supported or metric not in out.columns:
+                continue
+            out[metric] = (
+                pd.array([pd.NA] * n, dtype="Int64")
+                if metric in _GENERIC_INT_METRICS
+                else pd.Series(np.nan, index=index, dtype="float64")
+            )
+
+        out["campaigns_reached"] = out["unique_campaign_count"]
+        dist = self._event_distribution_by_customer(work)
+        out["event_distribution"] = pd.Series(
+            {c: dist.get(c, {}) for c in index}, dtype="object"
+        )
+        return out.reset_index()
+
+    @staticmethod
+    def _repeat_impression_counts(work: pd.DataFrame) -> pd.Series:
+        """Per-customer count of repeat exposures (same campaign seen again)."""
+        imps = work.loc[
+            work["role"].eq("impression") & work["campaign"].notna()
+        ].sort_values("ts", kind="stable")
+        if imps.empty:
+            return pd.Series(dtype="float64")
+        seq = imps.groupby(["customerId", "campaign"], sort=False).cumcount() + 1
+        imps = imps.assign(_is_repeat=seq.gt(1).to_numpy())
+        return imps.groupby("customerId")["_is_repeat"].sum().astype("float64")
+
+    @staticmethod
+    def _event_distribution_by_customer(
+        work: pd.DataFrame,
+    ) -> Dict[str, Dict[str, float]]:
+        """Per-customer proportion of each canonical role (sums to 1)."""
+        counts = work.groupby(["customerId", "role"]).size()
+        result: Dict[str, Dict[str, float]] = {}
+        for customer, sub in counts.groupby(level=0):
+            total = float(sub.sum())
+            result[customer] = {
+                role: round(float(c) / total, 4) for (_, role), c in sub.items()
+            }
+        return result
+
+    # -- dataset summary ---------------------------------------------------
+
+    def _summary(
+        self, work: pd.DataFrame, customer_metrics: pd.DataFrame
+    ) -> Dict[str, Any]:
+        role_counts = work["role"].value_counts()
+        total = float(role_counts.sum()) or 1.0
+        event_distribution = {
+            role: round(float(c) / total, 4) for role, c in role_counts.items()
+        }
+        campaign_events = work.loc[work["campaign"].notna() & work["role"].ne("other")]
+        campaign_reach = (
+            campaign_events.groupby("campaign")["customerId"]
+            .nunique()
+            .astype(int)
+            .to_dict()
+        )
+        caps = self._capabilities()
+        gates = self._metric_gates(caps)
+        # Averages only for metrics the schema supports (unsupported are <NA>).
+        metric_averages = {
+            m: float(customer_metrics[m].astype("float64").mean())
+            for m in GENERIC_NUMERIC_METRICS
+            if m in customer_metrics.columns and gates.get(m, True)
+        }
+        return {
+            "n_customers": int(customer_metrics["customerId"].nunique()),
+            "n_events": int(len(work)),
+            "n_sessions": int(work["sessionId"].nunique()),
+            "n_campaigns": int(campaign_events["campaign"].nunique()),
+            "event_distribution": event_distribution,
+            "campaign_reach": campaign_reach,
+            "metric_averages": metric_averages,
+            "capabilities": caps,
+            "unavailable_metrics": sorted(m for m, ok in gates.items() if not ok),
+        }
+
+    # -- empties -----------------------------------------------------------
+
+    @staticmethod
+    def _empty_metrics() -> pd.DataFrame:
+        cols = ["customerId", *GENERIC_NUMERIC_METRICS, "campaigns_reached",
+                "event_distribution"]
+        return pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
+
+    @staticmethod
+    def _empty_summary() -> Dict[str, Any]:
+        return {
+            "n_customers": 0,
+            "n_events": 0,
+            "n_sessions": 0,
+            "n_campaigns": 0,
+            "event_distribution": {},
+            "campaign_reach": {},
+            "metric_averages": {},
+            "capabilities": {},
+            "unavailable_metrics": [],
+        }
 
 
 # ===========================================================================
