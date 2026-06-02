@@ -3,3 +3,4 @@ pandas>=2.0
 numpy>=1.24
 openpyxl>=3.1        # read the XLSX-disguised-as-CSV telemetry export
 PyYAML>=6.0          # configs/*.yaml (semantic mappings, analytics thresholds)
+reportlab>=4.0       # reports/pdf_report_generator.py (PDF export)
