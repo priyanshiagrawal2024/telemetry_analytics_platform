@@ -1,252 +1,121 @@
 """Analytics serving endpoints for the Telemetry Analytics Platform.
 
-This module is the **HTTP serving surface** for analytics. It exposes read-only
-endpoints that return per-customer analytics and a dataset summary. It does NOT
-compute analytics itself — computation is the Analytics Engine's responsibility.
+This module is the **HTTP serving surface** for analytics. It is a thin adapter:
+it maps URLs to the analytics read-facade and translates errors into HTTP
+responses. It contains **no analytics logic** — every metric, score, and insight
+is produced by :mod:`analytics.analytics_service` (which itself is a facade over
+the analytics runner). Routes only invoke service methods and return their
+result verbatim.
 
-Integration seam
-----------------
-Route handlers delegate to an :class:`AnalyticsProvider`. Today a
-:class:`MockAnalyticsProvider` returns placeholder data so the API contract and
-Swagger docs are stable immediately. When the analytics runner is ready, swap it
-in via :func:`set_analytics_provider` — **no route or response-shape changes**.
+Endpoints
+---------
+* ``GET /analytics/customer/{customerId}`` -> ``analytics_service.get_customer_analytics``
+* ``GET /analytics/summary``               -> ``analytics_service.get_dataset_summary``
+* ``GET /analytics/campaigns``             -> ``analytics_service.get_campaign_summary``
 
-Contract alignment
-------------------
-Response shapes mirror ``contracts/analytics_contract.md``: ``metrics`` / ``scores``
-use the v2 *supported* metric names (§3), and fields the contract marks as
-*placeholders* (§4 — ``conversion_rate``, ``fatigue_score``, segmentation) are
-returned as ``null`` rather than fabricated values. Insights are
-descriptive/diagnostic only (platform guardrail), never prescriptive.
+Responses are the service's own (capability-gated) shapes, passed through
+unchanged so the API never fabricates or reshapes analytics output.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import Optional, Protocol
+from typing import Any, Callable, Dict
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, status
+
+from analytics import analytics_service
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Response models (mirror analytics_contract.md §3/§4/§6)
-# ---------------------------------------------------------------------------
-
-
-class CustomerMetrics(BaseModel):
-    """Supported per-customer metrics (analytics_contract.md §3).
-
-    Placeholder metrics (§4) are typed ``Optional`` and default to ``None`` —
-    they signal *missing capability*, never a misleading zero.
-    """
-
-    total_impressions: int
-    total_clicks: int
-    total_skips: int
-    ctr: Optional[float] = None  # %
-    skip_rate: Optional[float] = None  # %
-    repeat_impression_rate: Optional[float] = None  # %
-    avg_time_to_click_sec: Optional[float] = None
-    avg_time_to_skip_sec: Optional[float] = None
-    conversion_rate: Optional[float] = None  # §4 placeholder (no conversion telemetry)
-
-
-class CustomerScores(BaseModel):
-    """Per-customer scores (0–1 unless noted). Placeholders default to ``None``."""
-
-    attention_score: Optional[float] = None  # clicks / (clicks + skips)
-    exploration_score: Optional[float] = None
-    campaign_diversity_score: Optional[float] = None
-    fatigue_score: Optional[float] = None  # §4 placeholder (needs population/temporal)
-
-
-class Insight(BaseModel):
-    """Descriptive/diagnostic insight (analytics_contract.md guardrails).
-
-    Explains observed behaviour with cited evidence — never prescribes actions.
-    """
-
-    insight_id: str
-    category: str
-    severity: str  # info | low | medium | high
-    headline: str
-    explanation: str
-    evidence: dict = Field(default_factory=dict)
-
-
-class CustomerAnalyticsResponse(BaseModel):
-    customerId: str
-    metrics: CustomerMetrics
-    scores: CustomerScores
-    insights: list[Insight] = Field(default_factory=list)
-    primary_segment: Optional[str] = None  # §4 placeholder (needs population)
-    source: str = "mock"  # "mock" until the analytics runner is integrated
-    generated_at: datetime
-
-
-class DatasetStatistics(BaseModel):
-    total_events: int
-    normalized_events: int
-    quarantined_events: int
-    impressions: int
-    clicks: int
-    skips: int
-
-
-class AnalyticsSummaryResponse(BaseModel):
-    dataset_statistics: DatasetStatistics
-    customer_count: int
-    campaign_count: int
-    source: str = "mock"
-    generated_at: datetime
-
-
-# ---------------------------------------------------------------------------
-# Provider seam — swap MockAnalyticsProvider for the real runner later
-# ---------------------------------------------------------------------------
-
-
-class AnalyticsProvider(Protocol):
-    """Interface the serving layer depends on. The analytics runner implements this."""
-
-    def customer_analytics(self, customer_id: str) -> CustomerAnalyticsResponse: ...
-
-    def summary(self) -> AnalyticsSummaryResponse: ...
-
-
-class MockAnalyticsProvider:
-    """Placeholder provider.
-
-    Returns deterministic, contract-shaped mock data grounded in the validated
-    sample reality (analytics_contract.md §7 / event_schema.md §12: 194 rows →
-    7 impressions / 3 clicks / 3 skips, 1 customer, 1 campaign). This makes the
-    API usable and demonstrable before the analytics runner exists.
-    """
-
-    def customer_analytics(self, customer_id: str) -> CustomerAnalyticsResponse:
-        metrics = CustomerMetrics(
-            total_impressions=7,
-            total_clicks=3,
-            total_skips=3,
-            ctr=42.86,
-            skip_rate=42.86,
-            repeat_impression_rate=0.0,
-            avg_time_to_click_sec=4.2,
-            avg_time_to_skip_sec=2.7,
-            conversion_rate=None,  # §4 placeholder
-        )
-        scores = CustomerScores(
-            attention_score=0.5,  # 3 / (3 + 3)
-            exploration_score=1.0,
-            campaign_diversity_score=1.0,
-            fatigue_score=None,  # §4 placeholder
-        )
-        insights = [
-            Insight(
-                insight_id="mock_ins_0001",
-                category="engagement",
-                severity="info",
-                headline="Balanced engagement on observed floaters",
-                explanation=(
-                    "Of the customer's reactions, half were clicks and half were "
-                    "skips (attention score 0.5), on a CTR of 42.9%. "
-                    "[MOCK DATA - illustrative only]"
-                ),
-                evidence={"ctr": 42.86, "skip_rate": 42.86, "attention_score": 0.5},
-            )
-        ]
-        return CustomerAnalyticsResponse(
-            customerId=customer_id,
-            metrics=metrics,
-            scores=scores,
-            insights=insights,
-            primary_segment=None,  # §4 placeholder (needs population)
-            source="mock",
-            generated_at=datetime.now(timezone.utc),
-        )
-
-    def summary(self) -> AnalyticsSummaryResponse:
-        return AnalyticsSummaryResponse(
-            dataset_statistics=DatasetStatistics(
-                total_events=194,
-                normalized_events=13,
-                quarantined_events=181,
-                impressions=7,
-                clicks=3,
-                skips=3,
-            ),
-            customer_count=1,
-            campaign_count=1,
-            source="mock",
-            generated_at=datetime.now(timezone.utc),
-        )
-
-
-# Module-level provider. Replace at runtime when the runner is ready.
-_provider: AnalyticsProvider = MockAnalyticsProvider()
-
-
-def set_analytics_provider(provider: AnalyticsProvider) -> None:
-    """Wire in the real analytics runner (future integration point)."""
-    global _provider
-    logger.info("Analytics provider set to %s", type(provider).__name__)
-    _provider = provider
-
-
-def get_analytics_provider() -> AnalyticsProvider:
-    """FastAPI dependency returning the active analytics provider."""
-    return _provider
-
-
-# ---------------------------------------------------------------------------
-# Router
-# ---------------------------------------------------------------------------
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
 
+def _service_call(operation: str, fn: Callable[..., Any], *args: Any) -> Any:
+    """Invoke a service function, mapping failures to HTTP errors.
+
+    Pure error-handling plumbing (no analytics logic): a missing dataset becomes
+    ``503``; any other pipeline failure becomes ``500``. Successful results are
+    returned untouched.
+    """
+    try:
+        return fn(*args)
+    except FileNotFoundError as exc:
+        logger.exception("Analytics dataset unavailable during %s", operation)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Analytics dataset is unavailable.",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - surface any pipeline failure as 500
+        logger.exception("Analytics pipeline failed during %s", operation)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to compute {operation}.",
+        ) from exc
+
+
 @router.get(
     "/customer/{customerId}",
-    response_model=CustomerAnalyticsResponse,
+    response_model=Dict[str, Any],
     summary="Per-customer analytics (metrics, scores, insights)",
+    responses={
+        404: {"description": "No analytics found for the given customer"},
+        503: {"description": "Analytics dataset unavailable"},
+        500: {"description": "Analytics computation failed"},
+    },
 )
-def customer_analytics(
-    customerId: str,
-    provider: AnalyticsProvider = Depends(get_analytics_provider),
-) -> CustomerAnalyticsResponse:
-    """Return analytics for a single customer.
+def get_customer_analytics(customerId: str) -> Dict[str, Any]:
+    """Return one customer's analytics record.
 
-    NOTE: currently backed by mock data (``source = "mock"``) until the
-    analytics runner is integrated.
+    Delegates to :func:`analytics.analytics_service.get_customer_analytics`. The
+    response is the service's per-customer object (``customer_id``, ``metrics``,
+    ``scores``, ``insights``, ``dashboard_summary``). Returns ``404`` when the
+    customer is not present in the analyzed dataset.
     """
-    return provider.customer_analytics(customerId)
+    record = _service_call(
+        "customer analytics", analytics_service.get_customer_analytics, customerId
+    )
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No analytics found for customer '{customerId}'.",
+        )
+    return record
 
 
 @router.get(
     "/summary",
-    response_model=AnalyticsSummaryResponse,
+    response_model=Dict[str, Any],
     summary="Dataset-level analytics summary",
+    responses={
+        503: {"description": "Analytics dataset unavailable"},
+        500: {"description": "Analytics computation failed"},
+    },
 )
-def analytics_summary(
-    provider: AnalyticsProvider = Depends(get_analytics_provider),
-) -> AnalyticsSummaryResponse:
-    """Return dataset statistics plus customer and campaign counts.
+def get_dataset_summary() -> Dict[str, Any]:
+    """Return the population-level dataset summary.
 
-    NOTE: currently backed by mock data (``source = "mock"``).
+    Delegates to :func:`analytics.analytics_service.get_dataset_summary`
+    (counts, capabilities, event distribution, campaign reach, metric averages).
     """
-    return provider.summary()
+    return _service_call("dataset summary", analytics_service.get_dataset_summary)
 
 
-__all__ = [
-    "router",
-    "AnalyticsProvider",
-    "MockAnalyticsProvider",
-    "set_analytics_provider",
-    "get_analytics_provider",
-    "CustomerAnalyticsResponse",
-    "AnalyticsSummaryResponse",
-]
+@router.get(
+    "/campaigns",
+    response_model=Dict[str, Any],
+    summary="Per-campaign analytics summary",
+    responses={
+        503: {"description": "Analytics dataset unavailable"},
+        500: {"description": "Analytics computation failed"},
+    },
+)
+def get_campaign_summary() -> Dict[str, Any]:
+    """Return the per-campaign summary, ranked by customers reached.
+
+    Delegates to :func:`analytics.analytics_service.get_campaign_summary`.
+    """
+    return _service_call("campaign summary", analytics_service.get_campaign_summary)
+
+
+__all__ = ["router"]
