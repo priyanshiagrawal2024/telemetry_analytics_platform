@@ -20,6 +20,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from api.analytics_routes import router as analytics_router
 from api.config_routes import router as config_router
 from database.connection import database
 from ingestion.telemetry_receiver import router as telemetry_router
@@ -87,6 +88,8 @@ def create_app() -> FastAPI:
     app.include_router(telemetry_router)
     # Configuration endpoints (semantic column registry).
     app.include_router(config_router)
+    # Analytics serving endpoints (mock-backed until the runner is integrated).
+    app.include_router(analytics_router)
 
     return app
 
