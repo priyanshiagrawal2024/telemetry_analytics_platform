@@ -1,0 +1,65 @@
+# =============================================================================
+# Analytics Thresholds, Weights & Normalization  (single source for tuning)
+# =============================================================================
+# ALL weights and thresholds live here — never hardcode them in Python.
+# Consumed by analytics/score_calculator.py and analytics/analysis_engine.py.
+# =============================================================================
+version: 1
+
+# -----------------------------------------------------------------------------
+# Metric normalization (raw metric value -> 0..1)
+#   method:   reference | minmax
+#     reference -> norm = clip(value / reference, 0, 1)   (robust at small N)
+#     minmax    -> norm = (value - min) / (max - min) across the population
+#                  (degenerate single-customer populations fall back to 0.5)
+#   reference:  scale denominator for the `reference` method
+#   invert:     true => a higher raw metric yields a LOWER normalized value
+# -----------------------------------------------------------------------------
+normalization:
+  ctr:                         {method: reference, reference: 100.0, invert: false}
+  click_rate:                  {method: reference, reference: 1.0,   invert: false}
+  exposure_frequency:          {method: reference, reference: 5.0,   invert: false}
+  interaction_frequency:       {method: reference, reference: 5.0,   invert: false}
+  average_events_per_session:  {method: reference, reference: 20.0,  invert: false}
+  unique_campaign_count:       {method: reference, reference: 10.0,  invert: false}
+  campaign_diversity:          {method: reference, reference: 1.0,   invert: false}
+  repeat_interaction_rate:     {method: reference, reference: 100.0, invert: false}
+
+# -----------------------------------------------------------------------------
+# Composite scores (0..1). Weights are over NORMALIZED metrics and are
+# renormalized at runtime over whichever inputs are actually available, so a
+# missing metric degrades the score gracefully instead of breaking it.
+# -----------------------------------------------------------------------------
+scores:
+  engagement_score:
+    description: How actively the customer interacts, relative to exposure.
+    weights:
+      ctr: 0.50
+      interaction_frequency: 0.30
+      click_rate: 0.20
+  exploration_score:
+    description: Breadth of distinct campaigns the customer engages with.
+    weights:
+      unique_campaign_count: 0.50
+      campaign_diversity: 0.50
+  campaign_receptiveness_score:
+    description: Responsiveness to campaign exposure.
+    weights:
+      ctr: 0.60
+      interaction_frequency: 0.40
+
+# -----------------------------------------------------------------------------
+# Observation generation (analysis_engine). Comparative observations compare a
+# customer to the dataset average; structural observations compare a customer's
+# own metrics to one another (population-free).
+# -----------------------------------------------------------------------------
+observations:
+  high_ratio: 1.20          # value >= avg * high_ratio  -> "more than average"
+  low_ratio: 0.80           # value <= avg * low_ratio   -> "less than average"
+  diversity_floor: 0.40     # campaign_diversity >= this -> "diverse" (absolute)
+  min_unique_campaigns: 2   # need >1 campaign before any diversity claim
+  exposure_interaction_gap: 1.30  # exposure_freq >= interaction_freq * this
+  min_population: 30        # population size for full-confidence comparisons
+  min_confidence_to_report: 0.05  # suppress observations below this confidence
+  confidence:
+    base: 0.90              # ceiling before population/effect discounting

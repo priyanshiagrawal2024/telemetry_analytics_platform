@@ -1,0 +1,90 @@
+# =============================================================================
+# Semantic Column & Event-Role Mappings  (configurable analytics framework)
+# =============================================================================
+# Decouples the analytics code from any single dataset's physical schema.
+#
+# A NEW dataset/domain is onboarded by adding a block under `datasets:` — no
+# Python change is required. The analytics modules reference canonical *roles*
+# (customer_id, session_id, event_type, campaign, action, screen, timestamp),
+# never physical column names.
+#
+# `event_roles` maps a raw `event_type` value (compared lower-cased) to a
+# canonical role. Roles used by the metric calculator:
+#   impression | click | skip | campaign_served | campaign_received |
+#   campaign_saved | conversion | other (anything unmapped)
+# A row whose role is `click` and whose `action` column contains a `skip_markers`
+# substring is reclassified to `skip` (some clients log a dismissal as a click).
+# =============================================================================
+version: 1
+default_dataset: myjio_floater
+
+datasets:
+
+  # ---------------------------------------------------------------------------
+  # Current dataset — MyJio in-app floater telemetry (telecom).
+  # Validated against sample_data/telemetry_sample.csv (see event_schema.md v2).
+  # ---------------------------------------------------------------------------
+  myjio_floater:
+    description: MyJio in-app floater telemetry (telecom domain).
+    columns:
+      customer_id: customerId
+      session_id: sessionId
+      event_type: event_type
+      campaign: click_action      # validated campaign key (NOT label)
+      action: label               # holds chosen action / skip marker
+      screen: newscreen_name
+      timestamp: event_timestamp  # epoch milliseconds
+    timestamp_unit: ms
+    event_roles:
+      "recharge floater impression": impression
+      "recharge floater clicks": click            # -> skip if label marks it
+      "floaterresponse": campaign_served
+      "campaign_response_received": campaign_received
+      "campaign_response_received_empty": campaign_received
+      "campaign_saved_in_db": campaign_saved
+    skip_markers: [skip, dismiss]
+    interaction_roles: [click, skip]
+    exposure_roles: [impression]
+
+  # ---------------------------------------------------------------------------
+  # Illustrative FUTURE domains — proof that onboarding is config-only.
+  # (Column/event names are placeholders; adjust when a real export arrives.)
+  # ---------------------------------------------------------------------------
+  finance_offers:
+    description: Example finance telemetry (in-app offer surfaces).
+    columns:
+      customer_id: user_id
+      session_id: session_id
+      event_type: event_name
+      campaign: offer_id
+      action: action_label
+      screen: page_name
+      timestamp: ts_millis
+    timestamp_unit: ms
+    event_roles:
+      "offer_shown": impression
+      "offer_tapped": click
+      "offer_dismissed": skip
+      "offer_delivered": campaign_served
+    skip_markers: [dismiss, ignore, close]
+    interaction_roles: [click, skip]
+    exposure_roles: [impression]
+
+  ecommerce_banners:
+    description: Example e-commerce telemetry (promo banners).
+    columns:
+      customer_id: shopperId
+      session_id: visitId
+      event_type: eventType
+      campaign: promoId
+      action: ctaLabel
+      screen: pageType
+      timestamp: epochMs
+    timestamp_unit: ms
+    event_roles:
+      "banner_impression": impression
+      "banner_click": click
+      "banner_close": skip
+    skip_markers: [close, skip, dismiss]
+    interaction_roles: [click, skip]
+    exposure_roles: [impression]

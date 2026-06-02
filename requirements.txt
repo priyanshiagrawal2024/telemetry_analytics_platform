@@ -1,6 +1,13 @@
-# Ingestion / infrastructure layer dependencies
+# Infrastructure / API dependencies
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
 asyncpg>=0.29
+
+# Configuration
 pyyaml>=6.0
+
+# Analytics dependencies
+pandas>=2.0
+numpy>=1.24
+openpyxl>=3.1
