@@ -38,9 +38,15 @@ import logging
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Iterable, Mapping, Optional
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Optional, Union
 
 from pydantic import BaseModel, Field
+
+try:  # pragma: no cover - import guard; only needed to read the registry
+    import yaml
+except Exception:  # pragma: no cover
+    yaml = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +65,40 @@ FUTURE_SKEW_TOLERANCE = timedelta(minutes=5)
 #: Campaign sentinel for rows missing ``click_action`` (event_schema.md §6).
 #: Such rows stay well-defined but are excluded from per-campaign reporting.
 UNKNOWN_CAMPAIGN = "__unknown_campaign__"
+
+#: Default location of the semantic column registry (contracts/column_registry.yaml).
+#: Resolved relative to the project root so it works regardless of CWD.
+COLUMN_REGISTRY_PATH = (
+    Path(__file__).resolve().parent.parent / "contracts" / "column_registry.yaml"
+)
+
+
+def load_column_registry(
+    path: Optional[Union[str, Path]] = None,
+) -> dict[str, Any]:
+    """Load and parse the semantic column registry (``column_registry.yaml``).
+
+    The registry maps each raw source column to a domain-neutral semantic role
+    (``entity_id``, ``event_time``, ``group_id`` …). It is the configuration
+    that lets the same analytics framework serve different domains without code
+    changes. This is read-only metadata and does not affect normalization.
+
+    Raises ``FileNotFoundError`` if the registry is missing, or ``RuntimeError``
+    if PyYAML is unavailable.
+    """
+    registry_path = Path(path) if path else COLUMN_REGISTRY_PATH
+    if yaml is None:  # pragma: no cover - environment guard
+        raise RuntimeError(
+            "PyYAML is required to read the column registry. Install it "
+            "(see requirements.txt)."
+        )
+    with open(registry_path, "r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Column registry at {registry_path} must be a mapping of columns."
+        )
+    return data
 
 
 class CanonicalEventType(str, Enum):
@@ -188,6 +228,7 @@ class EventNormalizer:
         conversion_type_mapping: Optional[Mapping[str, ConversionType]] = None,
         mapping_version: str = MAPPING_VERSION,
         future_skew_tolerance: timedelta = FUTURE_SKEW_TOLERANCE,
+        column_registry: Optional[Mapping[str, Any]] = None,
     ) -> None:
         # Case-insensitive matching on trimmed, lower-cased values (§5.4).
         self._impression_events = frozenset(
@@ -205,6 +246,40 @@ class EventNormalizer:
         }
         self.mapping_version = mapping_version
         self.future_skew_tolerance = future_skew_tolerance
+        # Optional semantic column registry. Read-only metadata: it lets callers
+        # resolve column meaning by role and does NOT affect normalization.
+        self.column_registry: Optional[dict[str, Any]] = (
+            dict(column_registry) if column_registry is not None else None
+        )
+
+    @classmethod
+    def with_registry(
+        cls, path: Optional[Union[str, Path]] = None, **kwargs: Any
+    ) -> "EventNormalizer":
+        """Construct a normalizer with the semantic column registry loaded."""
+        return cls(column_registry=load_column_registry(path), **kwargs)
+
+    # -- semantic registry access (read-only; no effect on normalization) --
+
+    def semantic_role(self, column: str) -> Optional[str]:
+        """Return the semantic role configured for a raw ``column``, if any."""
+        if not self.column_registry:
+            return None
+        entry = self.column_registry.get(column)
+        if isinstance(entry, Mapping):
+            role = entry.get("semantic_role")
+            return str(role) if role is not None else None
+        return None
+
+    def columns_for_role(self, role: str) -> list[str]:
+        """Return all raw column names mapped to the given semantic ``role``."""
+        if not self.column_registry:
+            return []
+        return [
+            column
+            for column, entry in self.column_registry.items()
+            if isinstance(entry, Mapping) and entry.get("semantic_role") == role
+        ]
 
     # -- public API --------------------------------------------------------
 
@@ -430,6 +505,8 @@ __all__ = [
     "CONVERSION_TYPE_MAPPING",
     "MAPPING_VERSION",
     "UNKNOWN_CAMPAIGN",
+    "COLUMN_REGISTRY_PATH",
+    "load_column_registry",
     "NormalizedEvent",
     "NormalizationResult",
     "NormalizationStatus",

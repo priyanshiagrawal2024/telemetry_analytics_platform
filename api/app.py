@@ -20,6 +20,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from api.config_routes import router as config_router
 from database.connection import database
 from ingestion.telemetry_receiver import router as telemetry_router
 
@@ -84,6 +85,8 @@ def create_app() -> FastAPI:
 
     # Telemetry endpoint registration (Ingestion Layer).
     app.include_router(telemetry_router)
+    # Configuration endpoints (semantic column registry).
+    app.include_router(config_router)
 
     return app
 
