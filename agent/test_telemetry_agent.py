@@ -125,16 +125,33 @@ def test_supported_ranking_campaign_reach() -> None:
 
 def test_unsupported_ranking_returns_insufficient() -> None:
     for q in (
-        "which campaign performed best",
-        "which campaign had the highest engagement",
-        "which campaign got the most clicks",
-        "what was clicked most often",
-        "what was shown least often",
-        "what did the customer interact with most",
+        "which campaign performed best",               # generic "performance"
+        "which campaign had the highest engagement",   # engagement not per-campaign
+        "which campaign had the most conversions",      # conversions not produced
+        "what was clicked most often",                  # no campaign dimension
+        "what was shown least often",                   # no campaign dimension
+        "what did the customer interact with most",     # no campaign dimension
     ):
         r = _AGENT.ask(q)
         assert r.answer == FALLBACK_ANSWER, q
         assert r.confidence == Confidence.LOW, q
+
+
+def test_supported_campaign_performance_ranking() -> None:
+    # CTR / clicks / impressions ARE exposed per campaign -> grounded answers.
+    for q in (
+        "which campaign has the highest ctr",
+        "which campaign has the lowest ctr",
+        "which campaign received the most clicks",
+        "which campaign received the fewest clicks",
+        "which campaign had the most impressions",
+        "which campaign had the least impressions",
+    ):
+        r = _AGENT.ask(q)
+        assert r.answer != FALLBACK_ANSWER, q
+        assert r.confidence in (Confidence.HIGH, Confidence.MEDIUM), q
+        assert len(r.evidence) >= 1, q                 # evidence included
+        assert _AGENT.route(q) == Capability.ANALYTICS_QUERY, q
 
 
 def test_ranking_deterministic() -> None:
@@ -155,6 +172,7 @@ def run() -> int:
         test_ranking_routes_to_analytics_query,
         test_supported_ranking_campaign_reach,
         test_unsupported_ranking_returns_insufficient,
+        test_supported_campaign_performance_ranking,
         test_ranking_deterministic,
     ]
     for t in tests:
