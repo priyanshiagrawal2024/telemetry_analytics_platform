@@ -63,6 +63,17 @@ _CUSTOMER_METRICS = [
 ]
 _CUSTOMER_SCORES = ["engagement_score", "exploration_score", "campaign_receptiveness_score"]
 
+# Ranking operators -> direction (deterministic; "max" wins if both appear).
+_RANK_MAX = ("most", "highest", "best", "top")
+_RANK_MIN = ("least", "lowest", "worst", "bottom")
+
+# Metric words the service does NOT expose at campaign/content grain. Their
+# presence in a ranking question means the ranking cannot be grounded.
+_UNAVAILABLE_CAMPAIGN_METRICS = (
+    "engagement", "perform", "click", "impression", "shown",
+    "interaction", "interact", "exposure", "conversion", "ctr",
+)
+
 
 def _fmt(value: Any, *, pct: bool = False, ndigits: int = 2) -> str:
     if value is None:
@@ -276,3 +287,75 @@ class AnalyticsTools:
             + "; ".join(parts) + "."
         )
         return AgentResponse(answer=answer, evidence=evidence, confidence=Confidence.MEDIUM)
+
+    # -- ranking-style analytics query ------------------------------------
+
+    def analytics_query(self, question: str) -> AgentResponse:
+        """Answer a ranking question ONLY when the service exposes the evidence.
+
+        The only campaign/content metric the service ranks on is campaign reach
+        (distinct customers reached). Any request for per-campaign performance,
+        engagement, clicks, impressions, exposure or interaction — or any
+        content-level ranking — is returned as insufficient evidence (no fake
+        ranking is ever produced).
+        """
+        q = (question or "").lower()
+        is_max = any(op in q for op in _RANK_MAX)
+        is_min = any(op in q for op in _RANK_MIN)
+        if not (is_max or is_min):
+            return AgentResponse.insufficient()
+        direction = "max" if is_max else "min"
+
+        # Supported: campaigns by reach, only when no unavailable metric is asked.
+        if "campaign" in q and not any(w in q for w in _UNAVAILABLE_CAMPAIGN_METRICS):
+            return self._rank_campaigns_by_reach(direction)
+
+        # Everything else is not grounded by analytics_service.
+        return AgentResponse.insufficient(
+            evidence=[
+                evidence_item("available_campaign_metric", "customers_reached", _SRC_CAMPAIGN),
+                evidence_item(
+                    "unavailable",
+                    "per-campaign engagement / clicks / impressions / exposure / "
+                    "interaction are not produced by analytics_service",
+                    _SRC_CAMPAIGN,
+                ),
+            ]
+        )
+
+    def _rank_campaigns_by_reach(self, direction: str) -> AgentResponse:
+        cs = svc.get_campaign_summary(path=self.path, dataset=self.dataset)
+        rows = cs.get("campaigns") or []
+        if not rows:
+            return AgentResponse.insufficient(
+                evidence=[evidence_item("campaigns", [], _SRC_CAMPAIGN)]
+            )
+        pairs = [(r.get("campaign"), int(r.get("customers_reached") or 0)) for r in rows]
+        values = [v for _, v in pairs]
+        hi, lo = max(values), min(values)
+        ranking_str = "; ".join(f"{n} = {v}" for n, v in pairs)
+        evidence = [
+            evidence_item(n, {"customers_reached": v}, _SRC_CAMPAIGN) for n, v in pairs
+        ]
+        note = (
+            " (Reach — distinct customers reached — is the only campaign-level metric "
+            "available; per-campaign engagement/CTR are not produced.)"
+        )
+
+        if hi == lo:
+            answer = (
+                f"All {len(pairs)} campaign(s) reached the same number of distinct "
+                f"customers ({hi}); by customers reached, no campaign ranks above "
+                f"another. Reach by campaign: {ranking_str}.{note}"
+            )
+            return AgentResponse(answer=answer, evidence=evidence, confidence=Confidence.MEDIUM)
+
+        target = hi if direction == "max" else lo
+        picks = [n for n, v in pairs if v == target]
+        label = "most" if direction == "max" else "fewest"
+        answer = (
+            f"By distinct customers reached, the campaign(s) reaching the {label} "
+            f"customers: {', '.join(picks)} ({target}). Reach by campaign: "
+            f"{ranking_str}.{note}"
+        )
+        return AgentResponse(answer=answer, evidence=evidence, confidence=Confidence.HIGH)

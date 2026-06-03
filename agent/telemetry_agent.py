@@ -63,6 +63,10 @@ _CAMPAIGN_KW = ("campaign",)
 _DATASET_KW = ("dataset", "overall", "platform", "population", "totals")
 _CUSTOMER_KW = ("customer", "user", "behaviour", "behavior", "profile",
                 "summary", "summarize", "summarise")
+# Ranking-style analytics queries: an operator + an entity must both appear.
+_RANK_OPS = ("most", "least", "highest", "lowest", "best", "worst", "top", "bottom")
+_RANK_ENTITY_KW = ("campaign", "click", "clicked", "impression", "impressions",
+                   "shown", "engagement", "interaction", "interact", "exposure", "reach")
 
 
 class TelemetryAgent:
@@ -83,6 +87,8 @@ class TelemetryAgent:
 
         if capability == Capability.HELP:
             return self._help_response()
+        if capability == Capability.ANALYTICS_QUERY:
+            return self.tools.analytics_query(question)
         if capability == Capability.LIST_METRICS:
             return self.tools.list_available_metrics()
         if capability == Capability.DATASET_SUMMARY:
@@ -159,6 +165,11 @@ class TelemetryAgent:
         # Help — listing the agent's own capabilities (highest priority).
         if self._has(lowered, _HELP_KW):
             return Capability.HELP
+        # Ranking-style analytics query: a ranking operator + a ranking entity.
+        # Checked before campaign/engagement so "which campaign reached the most
+        # customers" is treated as a ranking, not a generic campaign explanation.
+        if self._has(lowered, _RANK_OPS) and self._has(lowered, _RANK_ENTITY_KW):
+            return Capability.ANALYTICS_QUERY
         # 7. list metrics — only when phrased as a listing request.
         if self._has(lowered, _METRICS_KW) and self._has(lowered, _METRICS_LIST_KW):
             return Capability.LIST_METRICS

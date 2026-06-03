@@ -101,6 +101,47 @@ def test_response_model_contract() -> None:
         assert set(_AGENT.ask(q).to_dict().keys()) == {"answer", "evidence", "confidence"}, q
 
 
+def test_ranking_routes_to_analytics_query() -> None:
+    for q in (
+        "which campaign reached the most customers",
+        "top campaign",
+        "which campaign performed best",
+        "which campaign had the highest engagement",
+        "what was clicked most often",
+        "what did the customer interact with least",
+    ):
+        assert _AGENT.route(q) == Capability.ANALYTICS_QUERY, q
+
+
+def test_supported_ranking_campaign_reach() -> None:
+    # Campaign reach IS exposed by analytics_service -> a grounded answer.
+    r = _AGENT.ask("which campaign reached the most customers")
+    assert r.answer != FALLBACK_ANSWER
+    assert r.confidence in (Confidence.HIGH, Confidence.MEDIUM)
+    assert len(r.evidence) >= 1                       # evidence included
+    assert any("customers_reached" in str(e.get("value")) for e in r.evidence)
+    assert "reach" in r.answer.lower()
+
+
+def test_unsupported_ranking_returns_insufficient() -> None:
+    for q in (
+        "which campaign performed best",
+        "which campaign had the highest engagement",
+        "which campaign got the most clicks",
+        "what was clicked most often",
+        "what was shown least often",
+        "what did the customer interact with most",
+    ):
+        r = _AGENT.ask(q)
+        assert r.answer == FALLBACK_ANSWER, q
+        assert r.confidence == Confidence.LOW, q
+
+
+def test_ranking_deterministic() -> None:
+    for q in ("which campaign reached the most customers", "which campaign performed best"):
+        assert _AGENT.ask(q).to_dict() == _AGENT.ask(q).to_dict(), q
+
+
 def run() -> int:
     tests = [
         test_help_capability,
@@ -111,6 +152,10 @@ def run() -> int:
         test_deterministic_behaviour,
         test_fallback_unchanged,
         test_response_model_contract,
+        test_ranking_routes_to_analytics_query,
+        test_supported_ranking_campaign_reach,
+        test_unsupported_ranking_returns_insufficient,
+        test_ranking_deterministic,
     ]
     for t in tests:
         t()
