@@ -39,6 +39,7 @@ __all__ = [
     "get_customer_analytics",
     "get_dataset_summary",
     "get_campaign_summary",
+    "get_campaign_performance",
     "available_customer_ids",
     "clear_cache",
     "DEFAULT_DATASET_PATH",
@@ -167,6 +168,29 @@ def get_campaign_summary(
         "dataset": result.get("dataset"),
         "n_campaigns": summary.get("n_campaigns", len(campaigns)),
         "campaigns": campaigns,
+    }
+
+
+def get_campaign_performance(
+    *,
+    path: Optional[Union[str, Path]] = None,
+    dataset: Optional[str] = None,
+    refresh: bool = False,
+) -> Dict[str, Any]:
+    """Return per-campaign funnel performance (additive; reach summary unchanged).
+
+    Surfaces the runner's ``campaign_performance`` rows — one per campaign that
+    has funnel events — with impressions, clicks, skips, CTR, skip_rate,
+    exposure_frequency and reach. Campaigns without funnel events are absent (no
+    fabricated performance); ``clicks``/``ctr`` or ``skips``/``skip_rate`` may be
+    ``None`` when the schema cannot derive them.
+    """
+    result = _result(path, dataset, refresh=refresh)
+    performance = result.get("campaign_performance", []) or []
+    return {
+        "dataset": result.get("dataset"),
+        "n_campaigns_with_funnel": len(performance),
+        "campaigns": performance,
     }
 
 

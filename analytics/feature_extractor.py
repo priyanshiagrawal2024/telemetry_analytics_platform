@@ -76,6 +76,7 @@ __all__ = [
     "CustomerProfile",
     "MetricCalculator",
     "MetricResult",
+    "CAMPAIGN_METRIC_COLUMNS",
     "extract_customer_profiles",
 ]
 
@@ -1133,6 +1134,19 @@ _GENERIC_INT_METRICS: FrozenSet[str] = frozenset(
 )
 
 
+#: Column order for the per-campaign funnel performance table (additive output).
+CAMPAIGN_METRIC_COLUMNS: tuple = (
+    "campaign",
+    "impressions",
+    "clicks",
+    "skips",
+    "ctr",
+    "skip_rate",
+    "exposure_frequency",
+    "reach",
+)
+
+
 @dataclass
 class MetricResult:
     """Output of :class:`MetricCalculator`.
@@ -1146,10 +1160,18 @@ class MetricResult:
         Population-level aggregates: counts, global ``event_distribution``,
         ``campaign_reach`` (campaign -> distinct customers) and
         ``metric_averages`` (mean of each numeric metric) for comparisons.
+    campaign_metrics:
+        One row per campaign that has funnel events, columns
+        :data:`CAMPAIGN_METRIC_COLUMNS` (impressions/clicks/skips/ctr/skip_rate/
+        exposure_frequency/reach). Additive; empty when there are no funnel
+        campaigns. Served-only campaigns are excluded (no fabricated CTR).
     """
 
     customer_metrics: pd.DataFrame
     dataset_summary: Dict[str, Any]
+    campaign_metrics: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(columns=list(CAMPAIGN_METRIC_COLUMNS))
+    )
 
 
 class MetricCalculator:
@@ -1176,10 +1198,13 @@ class MetricCalculator:
         work = self._normalise(raw)
         if work.empty:
             logger.warning("No usable rows for metric calculation.")
-            return MetricResult(self._empty_metrics(), self._empty_summary())
+            return MetricResult(
+                self._empty_metrics(), self._empty_summary(), self._empty_campaign_metrics()
+            )
 
         customer_metrics = self._per_customer(work)
         dataset_summary = self._summary(work, customer_metrics)
+        campaign_metrics = self._campaign_metrics(work)
         logger.info(
             "Computed generic metrics for %d customer(s) over %d events.",
             len(customer_metrics),
@@ -1195,7 +1220,7 @@ class MetricCalculator:
                 len(unavailable),
                 unavailable,
             )
-        return MetricResult(customer_metrics, dataset_summary)
+        return MetricResult(customer_metrics, dataset_summary, campaign_metrics)
 
     # -- capability gating -------------------------------------------------
 
@@ -1470,6 +1495,76 @@ class MetricCalculator:
             "capabilities": {},
             "unavailable_metrics": [],
         }
+
+    # -- campaign-grain funnel metrics (additive) -------------------------
+
+    def _campaign_metrics(self, work: pd.DataFrame) -> pd.DataFrame:
+        """Per-campaign funnel performance from the classified funnel events.
+
+        Groups the already-classified ``impression`` / ``click`` / ``skip``
+        events by campaign (``click_action``). Only campaigns that actually have
+        funnel events appear — served-only campaigns (no impression/click/skip)
+        are excluded so CTR is never invented for them. Capability gating mirrors
+        the customer grain: ``clicks``/``ctr`` and ``skips``/``skip_rate`` are
+        ``<NA>`` when the schema cannot derive them (never a fake 0).
+        """
+        caps = self._capabilities()
+        funnel = work.loc[
+            work["role"].isin(("impression", "click", "skip"))
+            & work["campaign"].notna()
+        ]
+        if funnel.empty or not caps["impression"]:
+            return self._empty_campaign_metrics()
+
+        index = pd.Index(sorted(funnel["campaign"].dropna().unique()), name="campaign")
+        n = len(index)
+
+        def _role_count(role: str) -> pd.Series:
+            return (
+                funnel.loc[funnel["role"].eq(role)]
+                .groupby("campaign").size()
+                .reindex(index).fillna(0).astype("Int64")
+            )
+
+        out = pd.DataFrame(index=index)
+        out["impressions"] = _role_count("impression")
+        out["clicks"] = _role_count("click")
+        out["skips"] = _role_count("skip")
+        out["reach"] = (
+            funnel.groupby("campaign")["customerId"].nunique()
+            .reindex(index).fillna(0).astype("Int64")
+        )
+
+        impressions = out["impressions"].astype("float64")
+        clicks = out["clicks"].astype("float64")
+        skips = out["skips"].astype("float64")
+        # Exposure frequency = impressions per distinct session the campaign was
+        # impressed in (campaign-grain analogue of the customer exposure metric).
+        impression_sessions = (
+            funnel.loc[funnel["role"].eq("impression")]
+            .groupby("campaign")["sessionId"].nunique()
+            .reindex(index).fillna(0).astype("float64")
+        )
+
+        out["ctr"] = _safe_div(clicks, impressions, scale=100.0)
+        out["skip_rate"] = _safe_div(skips, impressions, scale=100.0)
+        out["exposure_frequency"] = _safe_div(impressions, impression_sessions)
+
+        # Capability gating: do not imply a fake 0 for an underivable signal.
+        if not caps["click"]:
+            out["clicks"] = pd.array([pd.NA] * n, dtype="Int64")
+            out["ctr"] = pd.Series(np.nan, index=index, dtype="float64")
+        if not caps["skip"]:
+            out["skips"] = pd.array([pd.NA] * n, dtype="Int64")
+            out["skip_rate"] = pd.Series(np.nan, index=index, dtype="float64")
+
+        return out.reset_index()[list(CAMPAIGN_METRIC_COLUMNS)]
+
+    @staticmethod
+    def _empty_campaign_metrics() -> pd.DataFrame:
+        return pd.DataFrame(
+            {c: pd.Series(dtype="object") for c in CAMPAIGN_METRIC_COLUMNS}
+        )
 
 
 # ===========================================================================
