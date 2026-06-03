@@ -36,6 +36,7 @@ __all__ = ["AnalyticsTools"]
 # Source tags for evidence provenance.
 _SRC_DATASET = "analytics_service.get_dataset_summary"
 _SRC_CAMPAIGN = "analytics_service.get_campaign_summary"
+_SRC_PERF = "analytics_service.get_campaign_performance"
 _SRC_CUSTOMER = "analytics_service.get_customer_analytics"
 _SRC_IDS = "analytics_service.available_customer_ids"
 
@@ -65,13 +66,21 @@ _CUSTOMER_SCORES = ["engagement_score", "exploration_score", "campaign_receptive
 
 # Ranking operators -> direction (deterministic; "max" wins if both appear).
 _RANK_MAX = ("most", "highest", "best", "top")
-_RANK_MIN = ("least", "lowest", "worst", "bottom")
+_RANK_MIN = ("least", "fewest", "lowest", "worst", "bottom")
 
-# Metric words the service does NOT expose at campaign/content grain. Their
-# presence in a ranking question means the ranking cannot be grounded.
-_UNAVAILABLE_CAMPAIGN_METRICS = (
-    "engagement", "perform", "click", "impression", "shown",
-    "interaction", "interact", "exposure", "conversion", "ctr",
+# Campaign performance metrics rankable from analytics_service outputs.
+_CAMPAIGN_METRIC_LABEL = {
+    "ctr": "CTR",
+    "skip_rate": "skip rate",
+    "clicks": "clicks",
+    "impressions": "impressions",
+    "skips": "skips",
+    "reach": "customers reached",
+}
+_CAMPAIGN_RATE_METRICS = frozenset({"ctr", "skip_rate"})
+# Campaign metric concepts NOT produced per campaign by analytics_service.
+_UNSUPPORTED_CAMPAIGN_WORDS = (
+    "engagement", "conversion", "exposure", "interaction", "interact", "perform",
 )
 
 
@@ -291,13 +300,14 @@ class AnalyticsTools:
     # -- ranking-style analytics query ------------------------------------
 
     def analytics_query(self, question: str) -> AgentResponse:
-        """Answer a ranking question ONLY when the service exposes the evidence.
+        """Answer a campaign ranking question ONLY from analytics_service outputs.
 
-        The only campaign/content metric the service ranks on is campaign reach
-        (distinct customers reached). Any request for per-campaign performance,
-        engagement, clicks, impressions, exposure or interaction — or any
-        content-level ranking — is returned as insufficient evidence (no fake
-        ranking is ever produced).
+        Supported per-campaign metrics: CTR, skip_rate, clicks, impressions,
+        skips (from ``get_campaign_performance``) and reach (from
+        ``get_campaign_summary``). Unsupported concepts (engagement / conversion
+        / exposure / interaction / generic "performance") and content-level
+        rankings without a campaign dimension return insufficient evidence — no
+        fabricated ranking is ever produced.
         """
         q = (question or "").lower()
         is_max = any(op in q for op in _RANK_MAX)
@@ -306,22 +316,58 @@ class AnalyticsTools:
             return AgentResponse.insufficient()
         direction = "max" if is_max else "min"
 
-        # Supported: campaigns by reach, only when no unavailable metric is asked.
-        if "campaign" in q and not any(w in q for w in _UNAVAILABLE_CAMPAIGN_METRICS):
-            return self._rank_campaigns_by_reach(direction)
+        if "campaign" not in q:
+            # Per-content ranking (e.g. "what was clicked most") is not produced.
+            return AgentResponse.insufficient(
+                evidence=[
+                    evidence_item(
+                        "note",
+                        "campaign-level ranking requires a campaign question; "
+                        "per-content ranking is not produced by analytics_service",
+                        _SRC_PERF,
+                    )
+                ]
+            )
 
-        # Everything else is not grounded by analytics_service.
-        return AgentResponse.insufficient(
-            evidence=[
-                evidence_item("available_campaign_metric", "customers_reached", _SRC_CAMPAIGN),
-                evidence_item(
-                    "unavailable",
-                    "per-campaign engagement / clicks / impressions / exposure / "
-                    "interaction are not produced by analytics_service",
-                    _SRC_CAMPAIGN,
-                ),
-            ]
-        )
+        metric = self._resolve_campaign_metric(q)
+        if metric is None:
+            return AgentResponse.insufficient(
+                evidence=[
+                    evidence_item(
+                        "available_campaign_metrics",
+                        sorted(_CAMPAIGN_METRIC_LABEL), _SRC_PERF,
+                    ),
+                    evidence_item(
+                        "unavailable",
+                        "per-campaign engagement / conversion / exposure / "
+                        "interaction are not produced by analytics_service",
+                        _SRC_PERF,
+                    ),
+                ]
+            )
+        if metric == "reach":
+            return self._rank_campaigns_by_reach(direction)
+        return self._rank_campaign_performance(metric, direction)
+
+    @staticmethod
+    def _resolve_campaign_metric(q: str) -> Optional[str]:
+        """Map a campaign ranking question to a supported metric (or None)."""
+        if "ctr" in q or "click-through" in q or "click through" in q:
+            return "ctr"
+        if "skip rate" in q or "skip_rate" in q:
+            return "skip_rate"
+        if "skip" in q or "dismiss" in q:
+            return "skips"
+        if "click" in q:
+            return "clicks"
+        if "impression" in q or "shown" in q or "shows" in q:
+            return "impressions"
+        if "reach" in q or "reached" in q or "customer" in q:
+            return "reach"
+        if any(w in q for w in _UNSUPPORTED_CAMPAIGN_WORDS):
+            return None
+        # Bare "which campaign is top/best" with no metric word -> default reach.
+        return "reach"
 
     def _rank_campaigns_by_reach(self, direction: str) -> AgentResponse:
         cs = svc.get_campaign_summary(path=self.path, dataset=self.dataset)
@@ -357,5 +403,54 @@ class AnalyticsTools:
             f"By distinct customers reached, the campaign(s) reaching the {label} "
             f"customers: {', '.join(picks)} ({target}). Reach by campaign: "
             f"{ranking_str}.{note}"
+        )
+        return AgentResponse(answer=answer, evidence=evidence, confidence=Confidence.HIGH)
+
+    def _rank_campaign_performance(self, metric: str, direction: str) -> AgentResponse:
+        """Rank funnel campaigns by a performance metric from get_campaign_performance."""
+        perf = svc.get_campaign_performance(path=self.path, dataset=self.dataset)
+        rows = perf.get("campaigns") or []
+        pairs = [
+            (r.get("campaign"), r.get(metric)) for r in rows if r.get(metric) is not None
+        ]
+        if not pairs:
+            return AgentResponse.insufficient(
+                evidence=[evidence_item("campaign_performance", rows, _SRC_PERF)]
+            )
+
+        is_pct = metric in _CAMPAIGN_RATE_METRICS
+        label = _CAMPAIGN_METRIC_LABEL.get(metric, metric)
+
+        def vf(value):
+            return _fmt(value, pct=True, ndigits=1) if is_pct else _fmt(value)
+
+        ranking_str = "; ".join(f"{n} = {vf(v)}" for n, v in pairs)
+        evidence = [evidence_item(n, {metric: v}, _SRC_PERF) for n, v in pairs]
+        note = " (Campaign performance is computed only for campaigns with funnel events.)"
+        values = [v for _, v in pairs]
+        hi, lo = max(values), min(values)
+
+        if len(pairs) == 1:
+            answer = (
+                f"Only one campaign has funnel events, so it ranks first by {label}: "
+                f"{pairs[0][0]} ({vf(pairs[0][1])}). Ranking by {label}: {ranking_str}.{note}"
+            )
+            return AgentResponse(answer=answer, evidence=evidence, confidence=Confidence.MEDIUM)
+        if hi == lo:
+            answer = (
+                f"All {len(pairs)} campaign(s) have the same {label} ({vf(hi)}); no "
+                f"campaign ranks above another. Ranking by {label}: {ranking_str}.{note}"
+            )
+            return AgentResponse(answer=answer, evidence=evidence, confidence=Confidence.MEDIUM)
+
+        target = hi if direction == "max" else lo
+        picks = [n for n, v in pairs if v == target]
+        if is_pct:
+            word = "highest" if direction == "max" else "lowest"
+        else:
+            word = "most" if direction == "max" else "fewest"
+        answer = (
+            f"By {label}, the campaign(s) with the {word}: {', '.join(picks)} "
+            f"({vf(target)}). Ranking by {label}: {ranking_str}.{note}"
         )
         return AgentResponse(answer=answer, evidence=evidence, confidence=Confidence.HIGH)

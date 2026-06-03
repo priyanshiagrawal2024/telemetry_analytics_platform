@@ -125,21 +125,88 @@ def test_supported_ranking_campaign_reach() -> None:
 
 def test_unsupported_ranking_returns_insufficient() -> None:
     for q in (
-        "which campaign performed best",
-        "which campaign had the highest engagement",
-        "which campaign got the most clicks",
-        "what was clicked most often",
-        "what was shown least often",
-        "what did the customer interact with most",
+        "which campaign performed best",               # generic "performance"
+        "which campaign had the highest engagement",   # engagement not per-campaign
+        "which campaign had the most conversions",      # conversions not produced
+        "what was clicked most often",                  # no campaign dimension
+        "what was shown least often",                   # no campaign dimension
+        "what did the customer interact with most",     # no campaign dimension
     ):
         r = _AGENT.ask(q)
         assert r.answer == FALLBACK_ANSWER, q
         assert r.confidence == Confidence.LOW, q
 
 
+def test_supported_campaign_performance_ranking() -> None:
+    # CTR / clicks / impressions ARE exposed per campaign -> grounded answers.
+    for q in (
+        "which campaign has the highest ctr",
+        "which campaign has the lowest ctr",
+        "which campaign received the most clicks",
+        "which campaign received the fewest clicks",
+        "which campaign had the most impressions",
+        "which campaign had the least impressions",
+    ):
+        r = _AGENT.ask(q)
+        assert r.answer != FALLBACK_ANSWER, q
+        assert r.confidence in (Confidence.HIGH, Confidence.MEDIUM), q
+        assert len(r.evidence) >= 1, q                 # evidence included
+        assert _AGENT.route(q) == Capability.ANALYTICS_QUERY, q
+
+
 def test_ranking_deterministic() -> None:
     for q in ("which campaign reached the most customers", "which campaign performed best"):
         assert _AGENT.ask(q).to_dict() == _AGENT.ask(q).to_dict(), q
+
+
+# The 10 campaign performance ranking questions required by the task, with the
+# analytics_service function each must be grounded in.
+_PERF_SRC = "analytics_service.get_campaign_performance"
+_REACH_SRC = "analytics_service.get_campaign_summary"
+_CAMPAIGN_RANKING_CASES = [
+    ("which campaign has highest ctr", _PERF_SRC),
+    ("which campaign has lowest ctr", _PERF_SRC),
+    ("which campaign has most clicks", _PERF_SRC),
+    ("which campaign has fewest clicks", _PERF_SRC),
+    ("which campaign has most impressions", _PERF_SRC),
+    ("which campaign has fewest impressions", _PERF_SRC),
+    ("which campaign has highest reach", _REACH_SRC),
+    ("which campaign has lowest reach", _REACH_SRC),
+    ("which campaign has highest skip rate", _PERF_SRC),
+    ("which campaign has lowest skip rate", _PERF_SRC),
+]
+
+
+def test_campaign_ranking_routes_and_grounding() -> None:
+    for q, src in _CAMPAIGN_RANKING_CASES:
+        # Routes to the analytics-query capability.
+        assert _AGENT.route(q) == Capability.ANALYTICS_QUERY, q
+        r = _AGENT.ask(q)
+        # Grounded answer (not the insufficient-evidence fallback).
+        assert r.answer != FALLBACK_ANSWER, q
+        assert r.confidence in (Confidence.HIGH, Confidence.MEDIUM), q
+        # Evidence is included and sourced from the expected service function.
+        assert len(r.evidence) >= 1, q
+        assert any(e.get("source") == src for e in r.evidence), q
+        # Response contract preserved.
+        assert set(r.to_dict().keys()) == {"answer", "evidence", "confidence"}, q
+
+
+def test_campaign_ranking_deterministic_full() -> None:
+    for q, _ in _CAMPAIGN_RANKING_CASES:
+        assert _AGENT.ask(q).to_dict() == _AGENT.ask(q).to_dict(), q
+
+
+def test_campaign_ranking_unsupported_still_insufficient() -> None:
+    # Concepts NOT produced per campaign must still return insufficient evidence.
+    for q in (
+        "which campaign has highest engagement",
+        "which campaign has most conversions",
+        "which campaign performed best",
+    ):
+        r = _AGENT.ask(q)
+        assert r.answer == FALLBACK_ANSWER, q
+        assert r.confidence == Confidence.LOW, q
 
 
 def run() -> int:
@@ -155,7 +222,11 @@ def run() -> int:
         test_ranking_routes_to_analytics_query,
         test_supported_ranking_campaign_reach,
         test_unsupported_ranking_returns_insufficient,
+        test_supported_campaign_performance_ranking,
         test_ranking_deterministic,
+        test_campaign_ranking_routes_and_grounding,
+        test_campaign_ranking_deterministic_full,
+        test_campaign_ranking_unsupported_still_insufficient,
     ]
     for t in tests:
         t()

@@ -64,7 +64,7 @@ _DATASET_KW = ("dataset", "overall", "platform", "population", "totals")
 _CUSTOMER_KW = ("customer", "user", "behaviour", "behavior", "profile",
                 "summary", "summarize", "summarise")
 # Ranking-style analytics queries: an operator + an entity must both appear.
-_RANK_OPS = ("most", "least", "highest", "lowest", "best", "worst", "top", "bottom")
+_RANK_OPS = ("most", "least", "fewest", "highest", "lowest", "best", "worst", "top", "bottom")
 _RANK_ENTITY_KW = ("campaign", "click", "clicked", "impression", "impressions",
                    "shown", "engagement", "interaction", "interact", "exposure", "reach")
 
