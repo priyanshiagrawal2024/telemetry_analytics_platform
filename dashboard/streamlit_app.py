@@ -443,6 +443,59 @@ def render_campaign_intelligence(base_url: str) -> None:
         )
 
 
+def render_campaign_performance() -> None:
+    """Per-campaign funnel performance from analytics_service (in-process)."""
+    with st.container(border=True):
+        st.markdown(
+            "<div class='card-title'>Campaign Performance</div>"
+            "<div class='card-sub'>Per-campaign funnel metrics. Click a column header to sort.</div>",
+            unsafe_allow_html=True,
+        )
+        try:
+            from analytics import analytics_service
+
+            data = analytics_service.get_campaign_performance()
+        except Exception as exc:  # service/pipeline unavailable
+            st.error(f"Could not load campaign performance: {exc}")
+            return
+
+        rows = data.get("campaigns") or []
+        if not rows:
+            st.info("No campaign performance data available.")
+            return
+
+        columns = [
+            "campaign",
+            "impressions",
+            "clicks",
+            "skips",
+            "ctr",
+            "skip_rate",
+            "exposure_frequency",
+            "reach",
+        ]
+        df = pd.DataFrame(rows).reindex(columns=columns)
+        st.dataframe(
+            df,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "campaign": st.column_config.TextColumn("Campaign", width="large"),
+                "impressions": st.column_config.NumberColumn("Impressions", format="%d"),
+                "clicks": st.column_config.NumberColumn("Clicks", format="%d"),
+                "skips": st.column_config.NumberColumn("Skips", format="%d"),
+                # CTR / skip rate are already 0-100; show as percentages but keep
+                # the underlying number so the column sorts numerically.
+                "ctr": st.column_config.NumberColumn("CTR", format="%.2f%%"),
+                "skip_rate": st.column_config.NumberColumn("Skip Rate", format="%.2f%%"),
+                "exposure_frequency": st.column_config.NumberColumn(
+                    "Exposure Frequency", format="%.2f"
+                ),
+                "reach": st.column_config.NumberColumn("Reach", format="%d"),
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Section 3 — Ask Analytics Agent (analytics query panel; not a chatbot)
 # ---------------------------------------------------------------------------
@@ -631,6 +684,8 @@ def main() -> None:
         render_customer_intelligence(base_url, customer_id)
     with tab2:
         render_campaign_intelligence(base_url)
+        st.write("")
+        render_campaign_performance()
     with tab3:
         render_agent_panel(customer_id)
     with tab4:
