@@ -29,6 +29,7 @@ class Capability:
     INSIGHT_EVIDENCE = "insight_evidence"        # 5. evidence supporting an insight
     FINDINGS = "findings"                        # 6. show generated findings
     LIST_METRICS = "list_metrics"                # 7. list available metrics
+    ANALYTICS_QUERY = "analytics_query"          # ranking-style analytics question
     HELP = "help"                                # list supported capabilities
     UNSUPPORTED = "unsupported"                  # fallback
 
