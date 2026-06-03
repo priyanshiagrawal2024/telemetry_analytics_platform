@@ -177,6 +177,7 @@ class AnalyticsRunner:
         metric_result = self._metrics.compute(raw)
         metrics = metric_result.customer_metrics
         summary = metric_result.dataset_summary
+        campaign_performance = metric_result.campaign_metrics
 
         # 4. Scores from the already-computed metrics (no recompute).
         scores = self._scorer.compute(metrics)
@@ -196,8 +197,16 @@ class AnalyticsRunner:
             "dataset_summary": {
                 k: _jsonable(summary.get(k)) for k in _SUMMARY_KEYS if k in summary
             },
+            "campaign_performance": self._campaign_rows(campaign_performance),
             "customers": customers,
         }
+
+    @staticmethod
+    def _campaign_rows(campaign_metrics: pd.DataFrame) -> List[Dict[str, Any]]:
+        """Per-campaign funnel performance rows, JSON-safe (additive)."""
+        if campaign_metrics is None or campaign_metrics.empty:
+            return []
+        return [_row_to_dict(row) for _, row in campaign_metrics.iterrows()]
 
     # -- assembly ----------------------------------------------------------
 
