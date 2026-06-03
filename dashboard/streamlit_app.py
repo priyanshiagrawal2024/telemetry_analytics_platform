@@ -130,6 +130,18 @@ html, body, [class*="css"] {
 .status { display:inline-block; padding:3px 12px; border-radius:999px; font-size:.74rem;
   font-weight:700; background:#EEF1F4; color:var(--muted); border:1px solid var(--border); }
 .status-ready { background:#E7F4EC; color:#1A7F37; border-color:#BBE3C9; }
+
+/* Overview capability cards */
+.overview-card { background:var(--card); border:1px solid var(--border); border-radius:12px;
+  padding:16px 18px; box-shadow:0 1px 2px rgba(16,24,40,.05); height:100%; }
+.overview-name { font-size:.95rem; font-weight:700; color:var(--text); }
+.overview-name::before { content:""; display:inline-block; width:8px; height:8px; border-radius:2px;
+  background:var(--accent); margin-right:8px; vertical-align:middle; }
+.overview-desc { font-size:.83rem; color:var(--muted); margin-top:6px; line-height:1.45; }
+
+/* Help / hint text */
+.help-text { font-size:.85rem; color:var(--muted); background:#EEF2F6; border:1px solid var(--border);
+  border-radius:8px; padding:10px 14px; line-height:1.5; }
 </style>
 """
 
@@ -302,6 +314,51 @@ def render_header_and_kpis(base_url: str, customer_ids: Tuple[str, ...]) -> None
         st.caption(
             f"Dataset `{summary.get('dataset')}` · source `{summary.get('source')}` · "
             f"generated {summary.get('generated_at')}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Overview — what the platform provides (manager orientation)
+# ---------------------------------------------------------------------------
+
+_OVERVIEW_CAPABILITIES: Tuple[Tuple[str, str], ...] = (
+    (
+        "Analytics Engine",
+        "Turns raw floater telemetry into evidence-based metrics, composite "
+        "scores, and insights — capability-gated, never fabricated.",
+    ),
+    (
+        "Campaign Intelligence",
+        "Per-campaign reach and funnel performance (impressions, clicks, "
+        "skips, CTR, skip rate, exposure frequency).",
+    ),
+    (
+        "Analytics Agent",
+        "A deterministic, no-LLM query layer that answers questions grounded "
+        "strictly in telemetry, with sourced evidence.",
+    ),
+    (
+        "Reports",
+        "One-click management-ready PDF report generated from the current "
+        "dataset.",
+    ),
+)
+
+
+def render_overview() -> None:
+    """Manager-facing orientation row: the four platform capabilities."""
+    section_header(
+        "Overview",
+        "Platform Capabilities",
+        "An explainable, read-only analytics workspace over MyJio floater telemetry.",
+    )
+    st.write("")
+    cols = st.columns(len(_OVERVIEW_CAPABILITIES), gap="medium")
+    for col, (name, desc) in zip(cols, _OVERVIEW_CAPABILITIES):
+        col.markdown(
+            f"<div class='overview-card'><div class='overview-name'>{name}</div>"
+            f"<div class='overview-desc'>{desc}</div></div>",
+            unsafe_allow_html=True,
         )
 
 
@@ -544,6 +601,15 @@ def render_agent_panel(customer_id: str) -> None:
         "Every answer is backed by sourced telemetry facts.",
     )
     st.write("")
+    st.markdown(
+        "<div class='help-text'>Ask about the dataset, a specific customer, "
+        "campaigns, findings, or evidence. Use the suggested queries below for "
+        "instant results, or type your own. Customer-specific questions use the "
+        "customer selected in the sidebar. Questions outside the supported set "
+        "return a clear \"insufficient evidence\" response rather than a guess.</div>",
+        unsafe_allow_html=True,
+    )
+    st.write("")
 
     cid = (customer_id or "").strip()
 
@@ -593,13 +659,20 @@ def render_reports(base_url: str, customer_id: str) -> None:
         generated_at = st.session_state.get("report_generated_at")
         pdf_bytes = st.session_state.get("report_pdf")
 
-        status_html = (
-            f"<span class='status status-ready'>Ready · generated {generated_at}</span>"
-            if pdf_bytes
-            else "<span class='status'>Not generated</span>"
-        )
+        if pdf_bytes:
+            size_kb = len(pdf_bytes) / 1024
+            status_html = "<span class='status status-ready'>Ready</span>"
+            detail = (
+                f"Generated {generated_at} · {size_kb:,.0f} KB · "
+                "ready to download."
+            )
+        else:
+            status_html = "<span class='status'>Not generated</span>"
+            detail = "No report has been generated in this session yet."
+
         st.markdown(
-            f"<div class='card-title'>Report status</div>{status_html}",
+            f"<div class='card-title'>Report status</div>{status_html}"
+            f"<div class='card-sub' style='margin-top:6px'>{detail}</div>",
             unsafe_allow_html=True,
         )
         st.write("")
@@ -670,6 +743,9 @@ def main() -> None:
     customer_ids = tuple(available_customers())
 
     render_header_and_kpis(base_url, customer_ids)
+    st.divider()
+
+    render_overview()
     st.divider()
 
     tab1, tab2, tab3, tab4 = st.tabs(
