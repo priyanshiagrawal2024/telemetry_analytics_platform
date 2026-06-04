@@ -10,6 +10,7 @@ Sourcing
 * ``GET /analytics/summary``               -> KPI band, dataset context
 * ``GET /analytics/customer/{customerId}``  -> Customer Intelligence (metrics/scores/insights)
 * ``GET /analytics/campaigns``             -> Campaign Intelligence
+* in-process ``analytics_service``          -> Campaign Performance
 * in-process ``TelemetryAgent.ask``         -> Ask Analytics Agent panel
 * in-process ``generate_pdf_report``        -> Reports
 
@@ -26,7 +27,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 import requests
@@ -43,23 +44,25 @@ REQUEST_TIMEOUT = 30  # seconds
 # Suggested analytics queries (labels -> query text sent to the agent).
 SUGGESTED_QUERIES: Tuple[Tuple[str, str], ...] = (
     ("Help", "help"),
-    ("Show Findings", "show findings"),
-    ("Show Evidence", "show evidence"),
-    ("Dataset Summary", "dataset summary"),
-    ("List Available Metrics", "list available metrics"),
-    ("Which Campaign Reached The Most Customers", "which campaign reached the most customers"),
+    ("Show findings", "show findings"),
+    ("Show evidence", "show evidence"),
+    ("Dataset summary", "dataset summary"),
+    ("List metrics", "list available metrics"),
+    ("Top campaign by reach", "which campaign reached the most customers"),
 )
 
 # Curated behavioural metrics shown on the Customer Intelligence "Metrics" card.
 _CUSTOMER_METRIC_FIELDS: Tuple[Tuple[str, str], ...] = (
-    ("Impressions", "total_impressions"),
-    ("Clicks", "total_clicks"),
-    ("Skips", "total_skips"),
-    ("CTR (%)", "ctr"),
-    ("Skip rate (%)", "skip_rate"),
     ("Repeat impression rate (%)", "repeat_impression_rate"),
     ("Avg session depth", "avg_session_depth"),
     ("Exploration score", "exploration_score"),
+)
+
+_OVERVIEW_CAPABILITIES: Tuple[Tuple[str, str], ...] = (
+    ("Analytics Engine", "Raw telemetry → evidence-based metrics, scores and insights. Capability-gated; never fabricated."),
+    ("Campaign Intelligence", "Per-campaign reach and funnel performance — impressions, clicks, skips, CTR, skip rate."),
+    ("Analytics Agent", "Deterministic, no-LLM query layer. Answers grounded strictly in telemetry, with sourced evidence."),
+    ("Reports", "One-click, management-ready PDF report generated from the current dataset."),
 )
 
 
@@ -69,79 +72,113 @@ _CUSTOMER_METRIC_FIELDS: Tuple[Tuple[str, str], ...] = (
 
 CUSTOM_CSS = """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
 :root {
-  --bg:#F6F7F9; --card:#FFFFFF; --border:#E6E8EB;
-  --text:#1F2933; --muted:#647382; --accent:#1F3B57;
+  --bg:#FAFAFC; --surface:#FFFFFF; --surface-2:#F3F4F7; --border:#ECEDF1;
+  --ink:#161B22; --muted:#6E7681; --accent:#4338CA; --accent-soft:#EEF0FB;
+  --ok:#15803D; --warn:#B45309; --bad:#B42318;
 }
-.stApp { background-color: var(--bg); }
-html, body, [class*="css"] {
-  font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:var(--text);
+html, body, [class*="css"], .stApp, button, input, textarea, select {
+  font-family:'Inter',-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
 }
-/* Quiet the default Streamlit chrome for a product feel */
+.stApp { background:var(--bg); color:var(--ink); }
+
+/* Quiet default Streamlit chrome */
 #MainMenu, footer, [data-testid="stToolbar"] { visibility:hidden; }
-[data-testid="stHeader"] { background:transparent; }
-.block-container { padding-top:2.2rem; max-width:1300px; }
+[data-testid="stHeader"] { background:transparent; height:0; }
+.block-container { padding-top:1.6rem; padding-bottom:3rem; max-width:1240px; }
 
-/* Bordered containers become cards */
+/* Bordered containers -> cards with a quiet hover lift */
 [data-testid="stVerticalBlockBorderWrapper"] {
-  background:var(--card); border:1px solid var(--border) !important; border-radius:12px;
-  box-shadow:0 1px 3px rgba(16,24,40,.06),0 1px 2px rgba(16,24,40,.04);
+  background:var(--surface); border:1px solid var(--border) !important; border-radius:16px;
+  box-shadow:0 1px 2px rgba(16,24,40,.04); transition:box-shadow .18s ease, border-color .18s ease;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:hover {
+  box-shadow:0 8px 24px rgba(16,24,40,.07); border-color:#E1E3EA !important;
 }
 
-/* Header */
-.tap-title { font-size:1.95rem; font-weight:700; letter-spacing:-.01em; margin:0; }
-.tap-subtitle { font-size:1.0rem; color:var(--muted); margin:2px 0 0 0; }
+/* Brand / header */
+.brandrow { display:flex; align-items:center; gap:14px; }
+.brand-mark { width:42px; height:42px; border-radius:11px; background:var(--accent); color:#fff;
+  display:flex; align-items:center; justify-content:center; font-weight:700; font-size:1rem;
+  letter-spacing:.02em; box-shadow:0 4px 12px rgba(67,56,202,.28); }
+.app-title { font-size:1.5rem; font-weight:700; letter-spacing:-.02em; line-height:1.1; }
+.app-sub { color:var(--muted); font-size:.9rem; margin-top:1px; }
 
-/* KPI cards */
-.kpi { background:var(--card); border:1px solid var(--border); border-radius:12px;
-  padding:16px 18px; box-shadow:0 1px 2px rgba(16,24,40,.05); }
-.kpi-label { font-size:.72rem; text-transform:uppercase; letter-spacing:.07em;
-  color:var(--muted); font-weight:700; }
-.kpi-value { font-size:1.8rem; font-weight:700; margin-top:6px; line-height:1.1; }
+/* Section titles */
+.eyebrow { font-size:.68rem; font-weight:700; letter-spacing:.13em; text-transform:uppercase; color:var(--accent); }
+.h-title { font-size:1.2rem; font-weight:700; letter-spacing:-.01em; margin-top:2px; }
+.h-desc  { color:var(--muted); font-size:.86rem; margin-top:2px; }
 
-/* Section headers */
-.section-eyebrow { font-size:.72rem; text-transform:uppercase; letter-spacing:.09em;
-  color:var(--accent); font-weight:700; }
-.section-title { font-size:1.25rem; font-weight:700; margin:1px 0 0 0; }
-.section-desc { color:var(--muted); font-size:.88rem; margin-top:1px; }
+/* KPI */
+.kpi { position:relative; background:var(--surface); border:1px solid var(--border); border-radius:16px;
+  padding:18px 20px 16px; box-shadow:0 1px 2px rgba(16,24,40,.04); transition:.18s; overflow:hidden; }
+.kpi:hover { transform:translateY(-2px); box-shadow:0 10px 26px rgba(16,24,40,.08); }
+.kpi::before { content:""; position:absolute; left:0; top:14px; bottom:14px; width:3px;
+  border-radius:3px; background:var(--accent); }
+.kpi-label { font-size:.7rem; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); font-weight:600; }
+.kpi-value { font-size:2rem; font-weight:700; margin-top:8px; letter-spacing:-.02em; line-height:1; }
+
+/* Capability cards */
+.cap { background:var(--surface); border:1px solid var(--border); border-radius:16px; padding:16px 18px;
+  height:100%; transition:.18s; }
+.cap:hover { transform:translateY(-2px); box-shadow:0 10px 24px rgba(16,24,40,.07); }
+.cap-name { font-weight:700; font-size:.95rem; display:flex; align-items:center; gap:9px; }
+.cap-dot { width:7px; height:7px; border-radius:50%; background:var(--accent); }
+.cap-desc { color:var(--muted); font-size:.82rem; line-height:1.55; margin-top:9px; }
+
+/* Context chip (active customer) */
+.chip { display:inline-flex; align-items:center; gap:8px; background:var(--surface-2);
+  border:1px solid var(--border); border-radius:999px; padding:5px 13px; font-size:.84rem; font-weight:600; }
+.chip-dot { width:8px; height:8px; border-radius:50%; }
+.dot-ok { background:#22C55E; } .dot-bad { background:#EF4444; }
+.chip-muted { color:var(--muted); font-weight:500; }
 
 /* Card internals */
-.card-title { font-size:.95rem; font-weight:700; margin-bottom:2px; }
+.card-title { font-size:.95rem; font-weight:700; }
 .card-sub { font-size:.78rem; color:var(--muted); }
-.score-row { display:flex; justify-content:space-between; font-size:.86rem; margin:10px 0 2px; }
-.score-name { color:var(--text); font-weight:600; }
-.score-val { color:var(--muted); font-variant-numeric:tabular-nums; }
 .insight-title { font-weight:700; font-size:.92rem; margin:0; }
-.insight-text { color:var(--muted); font-size:.86rem; margin:2px 0 0 0; }
+.insight-text { color:var(--muted); font-size:.86rem; margin:3px 0 0 0; line-height:1.5; }
+
+/* Custom bars (funnel / scores) */
+.bars { margin-top:6px; }
+.bar-row { display:flex; align-items:center; gap:12px; margin:9px 0; }
+.bar-label { width:130px; font-size:.82rem; color:var(--ink); font-weight:500; }
+.bar-track { flex:1; height:9px; background:var(--surface-2); border-radius:999px; overflow:hidden; }
+.bar-fill { height:100%; background:var(--accent); border-radius:999px; }
+.bar-val { width:64px; text-align:right; font-size:.82rem; color:var(--muted); font-variant-numeric:tabular-nums; }
 
 /* Confidence badges */
-.badge { display:inline-block; padding:3px 12px; border-radius:999px; font-weight:700;
-  font-size:.72rem; letter-spacing:.04em; }
-.badge-high { background:#E7F4EC; color:#1A7F37; border:1px solid #BBE3C9; }
-.badge-medium { background:#FBF1DA; color:#8A6100; border:1px solid #EAD6A6; }
-.badge-low { background:#FBE7E7; color:#B3261E; border:1px solid #F0C2C0; }
+.badge { display:inline-block; padding:3px 12px; border-radius:999px; font-weight:700; font-size:.72rem; letter-spacing:.04em; }
+.badge-high { background:#E7F4EC; color:#15803D; border:1px solid #C3E6CE; }
+.badge-medium { background:#FBF1DA; color:#B45309; border:1px solid #EAD6A6; }
+.badge-low { background:#FBE7E7; color:#B42318; border:1px solid #F0C2C0; }
 
-/* Answer card (query result) */
-.answer-card { background:var(--card); border:1px solid var(--border);
-  border-left:3px solid var(--accent); border-radius:10px; padding:16px 18px;
-  font-size:1.04rem; line-height:1.55; box-shadow:0 1px 2px rgba(16,24,40,.05); }
+/* Answer card */
+.answer-card { background:var(--surface); border:1px solid var(--border); border-left:3px solid var(--accent);
+  border-radius:12px; padding:18px 20px; font-size:1.02rem; line-height:1.6; }
 
 /* Status pill */
-.status { display:inline-block; padding:3px 12px; border-radius:999px; font-size:.74rem;
-  font-weight:700; background:#EEF1F4; color:var(--muted); border:1px solid var(--border); }
-.status-ready { background:#E7F4EC; color:#1A7F37; border-color:#BBE3C9; }
+.status { display:inline-block; padding:3px 12px; border-radius:999px; font-size:.74rem; font-weight:700;
+  background:var(--surface-2); color:var(--muted); border:1px solid var(--border); }
+.status-ready { background:#E7F4EC; color:#15803D; border-color:#C3E6CE; }
 
-/* Overview capability cards */
-.overview-card { background:var(--card); border:1px solid var(--border); border-radius:12px;
-  padding:16px 18px; box-shadow:0 1px 2px rgba(16,24,40,.05); height:100%; }
-.overview-name { font-size:.95rem; font-weight:700; color:var(--text); }
-.overview-name::before { content:""; display:inline-block; width:8px; height:8px; border-radius:2px;
-  background:var(--accent); margin-right:8px; vertical-align:middle; }
-.overview-desc { font-size:.83rem; color:var(--muted); margin-top:6px; line-height:1.45; }
+/* Tabs */
+[data-baseweb="tab-list"] { gap:6px; border-bottom:1px solid var(--border); }
+button[data-baseweb="tab"] { font-weight:600; color:var(--muted); }
+button[data-baseweb="tab"][aria-selected="true"] { color:var(--accent); }
+[data-baseweb="tab-highlight"] { background:var(--accent); height:2.5px; }
 
-/* Help / hint text */
-.help-text { font-size:.85rem; color:var(--muted); background:#EEF2F6; border:1px solid var(--border);
-  border-radius:8px; padding:10px 14px; line-height:1.5; }
+/* Buttons */
+.stButton > button { border-radius:10px; font-weight:600; border:1px solid var(--border); }
+.stButton > button:hover { border-color:var(--accent); color:var(--accent); }
+.stButton > button[kind="primary"], [data-testid="baseButton-primary"] {
+  background:var(--accent); border-color:var(--accent); color:#fff; }
+
+/* Inputs / progress accents */
+[data-baseweb="select"] > div, .stTextInput input { border-radius:10px; }
+[data-testid="stProgress"] > div > div > div > div { background-color:var(--accent); }
 </style>
 """
 
@@ -151,7 +188,7 @@ def inject_css() -> None:
 
 
 # ---------------------------------------------------------------------------
-# API client + in-process components (no analytics logic here)
+# Data access (no analytics logic here — only fetch/format)
 # ---------------------------------------------------------------------------
 
 
@@ -190,7 +227,7 @@ def available_customers() -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Formatting / small render helpers (display only)
+# Formatting / render helpers (display only)
 # ---------------------------------------------------------------------------
 
 
@@ -207,28 +244,42 @@ def fmt(value: Any) -> str:
 
 
 def section_header(eyebrow: str, title: str, desc: str = "") -> None:
-    html = (
-        f"<div class='section-eyebrow'>{eyebrow}</div>"
-        f"<div class='section-title'>{title}</div>"
-    )
+    html = f"<div class='eyebrow'>{eyebrow}</div><div class='h-title'>{title}</div>"
     if desc:
-        html += f"<div class='section-desc'>{desc}</div>"
+        html += f"<div class='h-desc'>{desc}</div>"
     st.markdown(html, unsafe_allow_html=True)
-
-
-def kpi_card(label: str, value: str) -> str:
-    return (
-        f"<div class='kpi'><div class='kpi-label'>{label}</div>"
-        f"<div class='kpi-value'>{value}</div></div>"
-    )
 
 
 def confidence_badge(confidence: str) -> str:
     level = (confidence or "low").lower()
-    cls = {"high": "badge-high", "medium": "badge-medium", "low": "badge-low"}.get(
-        level, "badge-low"
-    )
+    cls = {"high": "badge-high", "medium": "badge-medium", "low": "badge-low"}.get(level, "badge-low")
     return f"<span class='badge {cls}'>{level.upper()}</span>"
+
+
+def bar_chart(pairs: Sequence[Tuple[str, Any]], max_value: Optional[float] = None) -> str:
+    """Render a compact, custom horizontal bar chart (label · bar · value)."""
+    numeric = [float(v) for _, v in pairs if isinstance(v, (int, float))]
+    top = max_value if max_value is not None else (max(numeric) if numeric else 1.0)
+    top = top or 1.0
+    rows = ""
+    for label, value in pairs:
+        v = float(value) if isinstance(value, (int, float)) else 0.0
+        pct = max(0.0, min(100.0, v / top * 100.0))
+        rows += (
+            f"<div class='bar-row'><span class='bar-label'>{label}</span>"
+            f"<div class='bar-track'><div class='bar-fill' style='width:{pct:.1f}%'></div></div>"
+            f"<span class='bar-val'>{fmt(value)}</span></div>"
+        )
+    return f"<div class='bars'>{rows}</div>"
+
+
+def active_chip(customer_id: str) -> None:
+    cid = (customer_id or "").strip()
+    text = f"Customer {cid}" if cid else "No customer selected"
+    st.markdown(
+        f"<span class='chip'><span class='chip-dot dot-ok'></span>{text}</span>",
+        unsafe_allow_html=True,
+    )
 
 
 def _as_response_dict(response: Any) -> Dict[str, Any]:
@@ -246,8 +297,7 @@ def _as_response_dict(response: Any) -> Dict[str, Any]:
 def connection_help(base_url: str) -> None:
     st.error(
         f"Unable to reach the analytics API at **{base_url}**. Start it with "
-        "`uvicorn api.app:app --host 127.0.0.1 --port 8000`, or update the URL "
-        "under **Connection** in the sidebar."
+        "`uvicorn api.app:app --host 127.0.0.1 --port 8000`, or update the URL in the sidebar."
     )
 
 
@@ -271,8 +321,58 @@ def evidence_dataframe(evidence: List[Any]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Header + KPI band
+# Header · context bar · KPI band · capabilities
 # ---------------------------------------------------------------------------
+
+
+def render_topbar(base_url: str) -> None:
+    left, right = st.columns([3, 1])
+    with left:
+        st.markdown(
+            "<div class='brandrow'><div class='brand-mark'>TA</div>"
+            "<div><div class='app-title'>Telemetry Analytics Platform</div>"
+            "<div class='app-sub'>Evidence-based customer telemetry intelligence</div></div></div>",
+            unsafe_allow_html=True,
+        )
+    with right:
+        _, status, _ = api_get(base_url, "/analytics/summary")
+        ok = status == 200
+        dot, label = ("dot-ok", "API connected") if ok else ("dot-bad", "API offline")
+        st.markdown(
+            f"<div style='text-align:right;margin-top:8px'><span class='chip'>"
+            f"<span class='chip-dot {dot}'></span>{label}</span></div>",
+            unsafe_allow_html=True,
+        )
+
+
+def render_context_bar(customers: List[str]) -> str:
+    """First-class customer selector — always visible above the tabs."""
+    with st.container(border=True):
+        cols = st.columns([2, 3])
+        with cols[0]:
+            if customers:
+                customer_id = st.selectbox(
+                    "Active customer", customers, key="active_customer"
+                )
+            else:
+                customer_id = st.text_input(
+                    "Active customer ID", key="active_customer",
+                    placeholder="e.g. 1015289504",
+                )
+        with cols[1]:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            cid = (customer_id or "").strip()
+            chip = (
+                f"<span class='chip'><span class='chip-dot dot-ok'></span>Customer {cid}</span>"
+                if cid else
+                "<span class='chip'><span class='chip-dot dot-bad'></span>None selected</span>"
+            )
+            st.markdown(
+                f"{chip}&nbsp;&nbsp;<span class='chip-muted' style='font-size:.82rem'>"
+                "Drives Customer Intelligence, Insights, Evidence &amp; Agent queries.</span>",
+                unsafe_allow_html=True,
+            )
+    return customer_id or ""
 
 
 def total_generated_insights(base_url: str, customer_ids: Tuple[str, ...]) -> Optional[int]:
@@ -286,14 +386,7 @@ def total_generated_insights(base_url: str, customer_ids: Tuple[str, ...]) -> Op
     return total
 
 
-def render_header_and_kpis(base_url: str, customer_ids: Tuple[str, ...]) -> None:
-    st.markdown(
-        "<div class='tap-title'>Telemetry Analytics Platform</div>"
-        "<div class='tap-subtitle'>Evidence-based customer telemetry intelligence</div>",
-        unsafe_allow_html=True,
-    )
-    st.write("")
-
+def render_kpis(base_url: str, customer_ids: Tuple[str, ...]) -> None:
     summary, status, error = api_get(base_url, "/analytics/summary")
     if error or summary is None:
         connection_help(base_url) if status is None else st.error(error)
@@ -308,76 +401,38 @@ def render_header_and_kpis(base_url: str, customer_ids: Tuple[str, ...]) -> None
     ]
     cols = st.columns(4, gap="medium")
     for col, (label, value) in zip(cols, cards):
-        col.markdown(kpi_card(label, value), unsafe_allow_html=True)
-
-    if summary:
-        st.caption(
-            f"Dataset `{summary.get('dataset')}` · source `{summary.get('source')}` · "
-            f"generated {summary.get('generated_at')}"
+        col.markdown(
+            f"<div class='kpi'><div class='kpi-label'>{label}</div>"
+            f"<div class='kpi-value'>{value}</div></div>",
+            unsafe_allow_html=True,
         )
 
 
-# ---------------------------------------------------------------------------
-# Overview — what the platform provides (manager orientation)
-# ---------------------------------------------------------------------------
-
-_OVERVIEW_CAPABILITIES: Tuple[Tuple[str, str], ...] = (
-    (
-        "Analytics Engine",
-        "Turns raw floater telemetry into evidence-based metrics, composite "
-        "scores, and insights — capability-gated, never fabricated.",
-    ),
-    (
-        "Campaign Intelligence",
-        "Per-campaign reach and funnel performance (impressions, clicks, "
-        "skips, CTR, skip rate, exposure frequency).",
-    ),
-    (
-        "Analytics Agent",
-        "A deterministic, no-LLM query layer that answers questions grounded "
-        "strictly in telemetry, with sourced evidence.",
-    ),
-    (
-        "Reports",
-        "One-click management-ready PDF report generated from the current "
-        "dataset.",
-    ),
-)
-
-
-def render_overview() -> None:
-    """Manager-facing orientation row: the four platform capabilities."""
-    section_header(
-        "Overview",
-        "Platform Capabilities",
-        "An explainable, read-only analytics workspace over MyJio floater telemetry.",
-    )
+def render_capabilities() -> None:
+    section_header("Overview", "Platform Capabilities")
     st.write("")
     cols = st.columns(len(_OVERVIEW_CAPABILITIES), gap="medium")
     for col, (name, desc) in zip(cols, _OVERVIEW_CAPABILITIES):
         col.markdown(
-            f"<div class='overview-card'><div class='overview-name'>{name}</div>"
-            f"<div class='overview-desc'>{desc}</div></div>",
+            f"<div class='cap'><div class='cap-name'><span class='cap-dot'></span>{name}</div>"
+            f"<div class='cap-desc'>{desc}</div></div>",
             unsafe_allow_html=True,
         )
 
 
 # ---------------------------------------------------------------------------
-# Section 1 — Customer Intelligence
+# Customer Intelligence
 # ---------------------------------------------------------------------------
 
 
 def render_customer_intelligence(base_url: str, customer_id: str) -> None:
-    section_header(
-        "Section 1",
-        "Customer Intelligence",
-        "Behavioural metrics, composite scores, and generated insights for the selected customer.",
-    )
+    section_header("Customer", "Customer Intelligence",
+                   "Behavioural funnel, composite scores, and generated insights.")
     st.write("")
 
     cid = (customer_id or "").strip()
     if not cid:
-        st.info("Select a customer in the sidebar to view their intelligence profile.")
+        st.info("Select a customer in the bar above to view their profile.")
         return
 
     data, status, error = api_get(base_url, f"/analytics/customer/{cid}")
@@ -393,55 +448,44 @@ def render_customer_intelligence(base_url: str, customer_id: str) -> None:
     insights = data.get("insights") or []
 
     top = st.columns(2, gap="medium")
-    # Metrics card
+    # Funnel + metrics
     with top[0]:
         with st.container(border=True):
-            st.markdown("<div class='card-title'>Metrics</div>", unsafe_allow_html=True)
-            st.markdown(
-                f"<div class='card-sub'>Customer {cid}</div>", unsafe_allow_html=True
-            )
-            m = st.columns(3)
-            m[0].metric("Impressions", fmt(behavioural.get("total_impressions")))
-            m[1].metric("Clicks", fmt(behavioural.get("total_clicks")))
-            m[2].metric("CTR (%)", fmt(behavioural.get("ctr")))
-            rows = [
-                {"Metric": label, "Value": fmt(behavioural.get(key))}
-                for label, key in _CUSTOMER_METRIC_FIELDS
+            st.markdown("<div class='card-title'>Engagement funnel</div>"
+                        f"<div class='card-sub'>Customer {cid}</div>", unsafe_allow_html=True)
+            funnel = [
+                ("Impressions", behavioural.get("total_impressions")),
+                ("Clicks", behavioural.get("total_clicks")),
+                ("Skips", behavioural.get("total_skips")),
             ]
-            st.dataframe(
-                pd.DataFrame(rows), hide_index=True, use_container_width=True
-            )
-    # Scores card
+            st.markdown(bar_chart(funnel), unsafe_allow_html=True)
+            st.write("")
+            m = st.columns(2)
+            m[0].metric("CTR", f"{fmt(behavioural.get('ctr'))}%")
+            m[1].metric("Skip rate", f"{fmt(behavioural.get('skip_rate'))}%")
+            rows = [{"Metric": label, "Value": fmt(behavioural.get(key))}
+                    for label, key in _CUSTOMER_METRIC_FIELDS]
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    # Scores
     with top[1]:
         with st.container(border=True):
-            st.markdown("<div class='card-title'>Scores</div>", unsafe_allow_html=True)
-            st.markdown(
-                "<div class='card-sub'>Composite scores (0–1)</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown("<div class='card-title'>Composite scores</div>"
+                        "<div class='card-sub'>Normalised 0–1</div>", unsafe_allow_html=True)
             if not scores:
                 st.caption("No scores returned.")
-            for name, value in scores.items():
-                label = name.replace("_", " ").title()
-                st.markdown(
-                    f"<div class='score-row'><span class='score-name'>{label}</span>"
-                    f"<span class='score-val'>{fmt(value)}</span></div>",
-                    unsafe_allow_html=True,
-                )
-                if isinstance(value, (int, float)):
-                    st.progress(min(max(float(value), 0.0), 1.0))
+            else:
+                pairs = [(name.replace("_", " ").title(), value) for name, value in scores.items()]
+                st.markdown(bar_chart(pairs, max_value=1.0), unsafe_allow_html=True)
 
-    # Insights card (full width)
+    # Insights
     with st.container(border=True):
         st.markdown("<div class='card-title'>Insights</div>", unsafe_allow_html=True)
         if not insights:
             st.caption("No insights generated for this customer.")
         for item in insights:
-            title = item.get("title", "Insight")
-            text = item.get("insight", "")
             st.markdown(
-                f"<p class='insight-title'>{title}</p>"
-                f"<p class='insight-text'>{text}</p>",
+                f"<p class='insight-title'>{item.get('title', 'Insight')}</p>"
+                f"<p class='insight-text'>{item.get('insight', '')}</p>",
                 unsafe_allow_html=True,
             )
             evidence = item.get("evidence") or {}
@@ -451,16 +495,13 @@ def render_customer_intelligence(base_url: str, customer_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Section 2 — Campaign Intelligence
+# Campaign Intelligence
 # ---------------------------------------------------------------------------
 
 
 def render_campaign_intelligence(base_url: str) -> None:
-    section_header(
-        "Section 2",
-        "Campaign Intelligence",
-        "Distinct customers reached per campaign. Click a column header to sort.",
-    )
+    section_header("Campaigns", "Campaign Intelligence",
+                   "Reach and funnel performance per campaign. Click a column header to sort.")
     st.write("")
 
     data, status, error = api_get(base_url, "/analytics/campaigns")
@@ -470,34 +511,29 @@ def render_campaign_intelligence(base_url: str) -> None:
 
     campaigns = data.get("campaigns") or []
     with st.container(border=True):
+        st.markdown("<div class='card-title'>Customers reached</div>", unsafe_allow_html=True)
         c = st.columns(2)
         c[0].metric("Campaigns", fmt(data.get("n_campaigns")))
         if campaigns:
-            reach_values = [int(r.get("customers_reached", 0)) for r in campaigns]
-            c[1].metric("Top reach", fmt(max(reach_values)) if reach_values else "—")
-
+            reach = [int(r.get("customers_reached", 0)) for r in campaigns]
+            c[1].metric("Top reach", fmt(max(reach)) if reach else "—")
         if not campaigns:
             st.caption("No campaign data available.")
-            return
+        else:
+            df = pd.DataFrame(campaigns).rename(
+                columns={"campaign": "Campaign", "customers_reached": "Customers Reached"})
+            max_reach = int(df["Customers Reached"].max()) if not df.empty else 1
+            st.dataframe(
+                df, hide_index=True, use_container_width=True,
+                column_config={
+                    "Campaign": st.column_config.TextColumn("Campaign", width="large"),
+                    "Customers Reached": st.column_config.ProgressColumn(
+                        "Customers Reached", format="%d", min_value=0, max_value=max(max_reach, 1)),
+                },
+            )
 
-        df = pd.DataFrame(campaigns).rename(
-            columns={"campaign": "Campaign", "customers_reached": "Customers Reached"}
-        )
-        max_reach = int(df["Customers Reached"].max()) if not df.empty else 1
-        st.dataframe(
-            df,
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "Campaign": st.column_config.TextColumn("Campaign", width="large"),
-                "Customers Reached": st.column_config.ProgressColumn(
-                    "Customers Reached",
-                    format="%d",
-                    min_value=0,
-                    max_value=max(max_reach, 1),
-                ),
-            },
-        )
+    st.write("")
+    render_campaign_performance()
 
 
 def render_campaign_performance() -> None:
@@ -510,7 +546,6 @@ def render_campaign_performance() -> None:
         )
         try:
             from analytics import analytics_service
-
             data = analytics_service.get_campaign_performance()
         except Exception as exc:  # service/pipeline unavailable
             st.error(f"Could not load campaign performance: {exc}")
@@ -521,40 +556,27 @@ def render_campaign_performance() -> None:
             st.info("No campaign performance data available.")
             return
 
-        columns = [
-            "campaign",
-            "impressions",
-            "clicks",
-            "skips",
-            "ctr",
-            "skip_rate",
-            "exposure_frequency",
-            "reach",
-        ]
+        columns = ["campaign", "impressions", "clicks", "skips", "ctr",
+                   "skip_rate", "exposure_frequency", "reach"]
         df = pd.DataFrame(rows).reindex(columns=columns)
         st.dataframe(
-            df,
-            hide_index=True,
-            use_container_width=True,
+            df, hide_index=True, use_container_width=True,
             column_config={
                 "campaign": st.column_config.TextColumn("Campaign", width="large"),
                 "impressions": st.column_config.NumberColumn("Impressions", format="%d"),
                 "clicks": st.column_config.NumberColumn("Clicks", format="%d"),
                 "skips": st.column_config.NumberColumn("Skips", format="%d"),
-                # CTR / skip rate are already 0-100; show as percentages but keep
-                # the underlying number so the column sorts numerically.
+                # Already 0-100; shown as % but kept numeric so the column sorts.
                 "ctr": st.column_config.NumberColumn("CTR", format="%.2f%%"),
                 "skip_rate": st.column_config.NumberColumn("Skip Rate", format="%.2f%%"),
-                "exposure_frequency": st.column_config.NumberColumn(
-                    "Exposure Frequency", format="%.2f"
-                ),
+                "exposure_frequency": st.column_config.NumberColumn("Exposure Freq.", format="%.2f"),
                 "reach": st.column_config.NumberColumn("Reach", format="%d"),
             },
         )
 
 
 # ---------------------------------------------------------------------------
-# Section 3 — Ask Analytics Agent (analytics query panel; not a chatbot)
+# Ask Analytics Agent (analytics query panel; not a chatbot)
 # ---------------------------------------------------------------------------
 
 
@@ -577,14 +599,10 @@ def _run_agent_query(question: str, customer_id: str) -> None:
         unsafe_allow_html=True,
     )
     st.markdown(f"<div class='answer-card'>{answer}</div>", unsafe_allow_html=True)
-
     if confidence == "low":
-        st.caption(
-            "This query is outside the supported analytics set. Use a suggested "
-            "query above for a grounded result."
-        )
+        st.caption("Outside the supported analytics set — try a suggested query for a grounded result.")
 
-    st.markdown("<div class='card-title'>Evidence</div>", unsafe_allow_html=True)
+    st.markdown("<div class='card-title' style='margin-top:6px'>Evidence</div>", unsafe_allow_html=True)
     ev_df = evidence_dataframe(evidence)
     if ev_df.empty:
         st.caption("No supporting evidence for this query.")
@@ -594,31 +612,27 @@ def _run_agent_query(question: str, customer_id: str) -> None:
 
 
 def render_agent_panel(customer_id: str) -> None:
-    section_header(
-        "Section 3",
-        "Ask Analytics Agent",
-        "Deterministic, evidence-grounded analytics queries (no LLM). "
-        "Every answer is backed by sourced telemetry facts.",
-    )
+    section_header("Agent", "Ask Analytics Agent",
+                   "Deterministic, evidence-grounded queries — no LLM, no guessing.")
     st.write("")
-    st.markdown(
-        "<div class='help-text'>Ask about the dataset, a specific customer, "
-        "campaigns, findings, or evidence. Use the suggested queries below for "
-        "instant results, or type your own. Customer-specific questions use the "
-        "customer selected in the sidebar. Questions outside the supported set "
-        "return a clear \"insufficient evidence\" response rather than a guess.</div>",
-        unsafe_allow_html=True,
-    )
-    st.write("")
-
     cid = (customer_id or "").strip()
-
-    with st.container(border=True):
+    cols = st.columns([3, 1])
+    with cols[0]:
         st.markdown(
-            "<div class='card-title'>Supported Analytics Queries</div>"
-            "<div class='card-sub'>Select a query to run it, or type your own below.</div>",
+            "<div class='help-text' style='font-size:.85rem;color:#6E7681'>"
+            "Ask about the dataset, the selected customer, campaigns, findings, or evidence. "
+            "Customer-specific questions use the active customer above. Unsupported questions "
+            "return a clear \"insufficient evidence\" reply rather than a guess.</div>",
             unsafe_allow_html=True,
         )
+    with cols[1]:
+        st.markdown("<div style='text-align:right'>", unsafe_allow_html=True)
+        active_chip(cid)
+        st.markdown("</div>", unsafe_allow_html=True)
+    st.write("")
+
+    with st.container(border=True):
+        st.markdown("<div class='card-title'>Suggested queries</div>", unsafe_allow_html=True)
         st.write("")
         chip_cols = st.columns(3, gap="small")
         for i, (label, query) in enumerate(SUGGESTED_QUERIES):
@@ -628,9 +642,8 @@ def render_agent_panel(customer_id: str) -> None:
 
         with st.form("agent_query_form"):
             query = st.text_input(
-                "Analytics query",
-                key="agent_query",
-                placeholder="e.g. explain engagement score for the selected customer",
+                "Analytics query", key="agent_query",
+                placeholder="e.g. explain the engagement score for the active customer",
             )
             submitted = st.form_submit_button("Run query", type="primary")
 
@@ -643,16 +656,13 @@ def render_agent_panel(customer_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Section 4 — Reports
+# Reports
 # ---------------------------------------------------------------------------
 
 
-def render_reports(base_url: str, customer_id: str) -> None:
-    section_header(
-        "Section 4",
-        "Reports",
-        "Generate a management-ready PDF analytics report from the current dataset.",
-    )
+def render_reports() -> None:
+    section_header("Reports", "Analytics Report",
+                   "Generate a management-ready PDF from the current dataset.")
     st.write("")
 
     with st.container(border=True):
@@ -662,10 +672,7 @@ def render_reports(base_url: str, customer_id: str) -> None:
         if pdf_bytes:
             size_kb = len(pdf_bytes) / 1024
             status_html = "<span class='status status-ready'>Ready</span>"
-            detail = (
-                f"Generated {generated_at} · {size_kb:,.0f} KB · "
-                "ready to download."
-            )
+            detail = f"Generated {generated_at} · {size_kb:,.0f} KB · ready to download."
         else:
             status_html = "<span class='status'>Not generated</span>"
             detail = "No report has been generated in this session yet."
@@ -681,27 +688,19 @@ def render_reports(base_url: str, customer_id: str) -> None:
         if cols[0].button("Generate report", type="primary", use_container_width=True):
             try:
                 from reports.pdf_report_generator import generate_pdf_report
-
                 with st.spinner("Generating PDF report…"):
                     out_path = generate_pdf_report()
                     st.session_state["report_pdf"] = Path(out_path).read_bytes()
-                    st.session_state["report_generated_at"] = datetime.now().strftime(
-                        "%Y-%m-%d %H:%M"
-                    )
+                    st.session_state["report_generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
                 st.rerun()
             except Exception as exc:
                 st.error(f"Report generation failed: {exc}")
 
         if pdf_bytes:
             cols[1].download_button(
-                "Download PDF",
-                data=pdf_bytes,
-                file_name="analytics_report.pdf",
-                mime="application/pdf",
-                use_container_width=True,
+                "Download PDF", data=pdf_bytes, file_name="analytics_report.pdf",
+                mime="application/pdf", use_container_width=True,
             )
-        else:
-            st.caption("Click **Generate report** to build the PDF, then download it.")
 
 
 # ---------------------------------------------------------------------------
@@ -709,63 +708,52 @@ def render_reports(base_url: str, customer_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def render_sidebar() -> Tuple[str, str]:
+def render_sidebar() -> str:
+    """Minimal sidebar: connection settings only (customer selection is up top)."""
     with st.sidebar:
-        st.markdown(
-            "<div class='card-title'>Telemetry Analytics</div>"
-            "<div class='card-sub'>Workspace</div>",
-            unsafe_allow_html=True,
-        )
+        st.markdown("<div class='card-title'>Workspace</div>"
+                    "<div class='card-sub'>Connection & data</div>", unsafe_allow_html=True)
         st.divider()
-
-        customers = available_customers()
-        if customers:
-            customer_id = st.selectbox("Customer", customers, index=0)
-        else:
-            customer_id = st.text_input(
-                "Customer ID", value="", placeholder="e.g. 1015289504"
-            )
-
-        base_url = DEFAULT_API_URL
-        with st.expander("Connection"):
-            base_url = st.text_input("Analytics API URL", value=DEFAULT_API_URL)
-            if st.button("Refresh data", use_container_width=True):
-                st.cache_data.clear()
-        st.caption("Read-only view. The engine is the single source of truth.")
-    return base_url, customer_id
+        base_url = st.text_input("Analytics API URL", value=DEFAULT_API_URL)
+        if st.button("Refresh data", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+        st.caption("Read-only view. The analytics engine is the single source of truth.")
+    return base_url
 
 
 def main() -> None:
-    st.set_page_config(page_title="Telemetry Analytics Platform", layout="wide")
+    st.set_page_config(
+        page_title="Telemetry Analytics Platform",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     inject_css()
 
-    base_url, customer_id = render_sidebar()
-    customer_ids = tuple(available_customers())
+    base_url = render_sidebar()
+    customers = available_customers()
+    customer_ids = tuple(customers)
 
-    render_header_and_kpis(base_url, customer_ids)
-    st.divider()
-
-    render_overview()
+    render_topbar(base_url)
+    st.write("")
+    customer_id = render_context_bar(customers)  # first-class, persistent selector
+    st.write("")
+    render_kpis(base_url, customer_ids)
+    st.write("")
+    render_capabilities()
     st.divider()
 
     tab1, tab2, tab3, tab4 = st.tabs(
-        [
-            "Customer Intelligence",
-            "Campaign Intelligence",
-            "Ask Analytics Agent",
-            "Reports",
-        ]
+        ["Customer Intelligence", "Campaign Intelligence", "Ask Analytics Agent", "Reports"]
     )
     with tab1:
         render_customer_intelligence(base_url, customer_id)
     with tab2:
         render_campaign_intelligence(base_url)
-        st.write("")
-        render_campaign_performance()
     with tab3:
         render_agent_panel(customer_id)
     with tab4:
-        render_reports(base_url, customer_id)
+        render_reports()
 
 
 if __name__ == "__main__":
