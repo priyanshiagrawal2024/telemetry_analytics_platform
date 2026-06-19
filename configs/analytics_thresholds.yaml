@@ -42,11 +42,11 @@ scores:
     weights:
       unique_campaign_count: 0.50
       campaign_diversity: 0.50
-  campaign_receptiveness_score:
-    description: Responsiveness to campaign exposure.
-    weights:
-      ctr: 0.60
-      interaction_frequency: 0.40
+  #campaign_receptiveness_score:
+   # description: Responsiveness to campaign exposure.
+    #weights:
+     # ctr: 0.60
+      #interaction_frequency: 0.40
 
 # -----------------------------------------------------------------------------
 # Observation generation (analysis_engine). Comparative observations compare a

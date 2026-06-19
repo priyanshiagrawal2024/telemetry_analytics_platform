@@ -23,7 +23,7 @@ Final output (per customer)::
     {
       "customer_id": ...,
       "metrics":  {"descriptive": {...generic...}, "behavioural": {...§6...}},
-      "scores":   {engagement_score, exploration_score, campaign_receptiveness_score},
+      "scores":   {engagement_score, exploration_score},
       "insights": [ {statement, supporting_metrics, evidence, confidence}, ... ]
     }
 

@@ -133,6 +133,10 @@ class InsightGenerator:
         interaction_freq = _num(m.get("interaction_frequency"))
         exposure_freq = _num(m.get("exposure_frequency"))
         aibc = _num(m.get("avg_impressions_before_click"))
+        # New metrics
+        peak_click_hour = m.get("peak_click_hour")
+        weekend_jump = _num(m.get("weekend_activity_jump"))
+        weekend_jump = _num(m.get("weekend_activity_jump"))
 
         # 1. ENGAGEMENT — merges CTR + skip rate + click/skip split -----------
         if impressions and clicks is not None and ctr is not None:
@@ -234,6 +238,36 @@ class InsightGenerator:
                 )
             )
             summary.append(f"First click came after ~{aibc:.1f} exposure(s) of a campaign.")
+
+
+        # 6. PEAK CLICK TIME
+        if peak_click_hour is not None:
+            insights.append(
+                self._mk(
+                    "Peak Click Activity",
+                    f"Most clicks occurred around {peak_click_hour}:00.",
+                    {
+                        "peak_click_hour": peak_click_hour
+                    }
+                )
+            )   
+            
+
+        if weekend_jump is not None and not pd.isna(weekend_jump):
+
+            insights.append(
+                self._mk(
+                    "Weekend activity",
+                    f"Weekend CTR differed from weekday CTR by {weekend_jump:.1f} percentage points.",
+                    {
+                    "weekend_activity_jump": round(
+                    weekend_jump,
+                    2
+                    )
+                    }
+                )
+            )
+
 
         return insights, summary[:4]
 

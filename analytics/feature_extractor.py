@@ -620,8 +620,13 @@ class CustomerProfile:
     skip_rate: float = np.nan          # label-derived (§3)
     conversion_rate: float = np.nan    # §4 placeholder
     repeat_impression_rate: float = np.nan
-
-    # --- Time metrics (seconds) ------------------------------------------
+    dropoff_rate: float = np.nan
+    peak_click_hour: float = np.nan
+    peak_impression_hour: float = np.nan
+    weekday_ctr: float = np.nan
+    weekend_ctr: float = np.nan
+    weekend_activity_jump: float = np.nan
+# --- Time metrics (seconds) ------------------------------------------
     avg_time_to_click_sec: float = np.nan
     avg_time_to_skip_sec: float = np.nan   # label-derived (§3)
     avg_session_depth: float = np.nan
@@ -699,6 +704,89 @@ class FeatureExtractor:
     per ``customerId``. Supported metrics (§3) are computed; unsupported ones
     (§4) are emitted as placeholders with logged warnings (§2).
     """
+    @staticmethod
+    def _time_variance_metrics(work: pd.DataFrame) -> pd.DataFrame:
+        """
+            Time variance metrics:
+        - peak click hour
+        - peak impression hour
+        - weekday ctr
+        - weekend ctr
+        - weekend activity jump
+        """
+
+        if work.empty:
+            return pd.DataFrame()
+
+        df = work.copy()
+
+        df["dt"] = pd.to_datetime(
+            df["event_timestamp"],
+            unit="ms",
+            utc=True
+        )
+        df["dt"] = (
+    pd.to_datetime(
+        df["event_timestamp"],
+        unit="ms",
+        utc=True
+    )
+    .dt.tz_convert("Asia/Kolkata")
+        )
+
+        df["hour"] = df["dt"].dt.hour
+        df["weekday"] = df["dt"].dt.weekday
+
+        customers = []
+
+        for customer_id, grp in df.groupby("customerId"):
+
+            clicks = grp[grp["event"] == "click"]
+            impressions = grp[grp["event"] == "impression"]
+
+            peak_click_hour = (
+                clicks["hour"].mode().iloc[0]
+                if not clicks.empty else np.nan
+            )
+
+            peak_impression_hour = (
+                impressions["hour"].mode().iloc[0]
+                if not impressions.empty else np.nan
+            )
+
+            weekend_imp = impressions[impressions["weekday"] >= 5]
+            weekday_imp = impressions[impressions["weekday"] < 5]
+
+            weekend_click = clicks[clicks["weekday"] >= 5]
+            weekday_click = clicks[clicks["weekday"] < 5]
+
+            weekend_ctr = (
+                len(weekend_click) / len(weekend_imp) * 100
+                if len(weekend_imp) > 0 else np.nan
+            )
+
+            weekday_ctr = (
+                len(weekday_click) / len(weekday_imp) * 100
+                if len(weekday_imp) > 0 else np.nan
+            )
+
+            jump = (
+                weekend_ctr - weekday_ctr
+                if pd.notna(weekend_ctr)
+                and pd.notna(weekday_ctr)
+                else np.nan
+            )
+
+            customers.append({
+                "customerId": customer_id,
+                "peak_click_hour": peak_click_hour,
+                "peak_impression_hour": peak_impression_hour,
+                "weekday_ctr": weekday_ctr,
+                "weekend_ctr": weekend_ctr,
+                "weekend_activity_jump": jump,
+            })
+
+        return pd.DataFrame(customers).set_index("customerId")
 
     def __init__(self, config: Optional[FeatureExtractorConfig] = None) -> None:
         self.config = config or FeatureExtractorConfig()
@@ -723,6 +811,8 @@ class FeatureExtractor:
         diversity = self._campaign_diversity(work)
         depth = self._session_depth(work)
         timestamps = self._event_timestamps(work)
+        time_variance = self._time_variance_metrics(work)
+        
         if self.config.compute_latency_metrics:
             click_latency = self._reaction_latency(work, EVENT_CLICK)
             skip_latency = self._reaction_latency(work, EVENT_SKIP)
@@ -746,6 +836,7 @@ class FeatureExtractor:
             diversity=diversity,
             depth=depth,
             timestamps=timestamps,
+            time_variance=time_variance,
             click_latency=click_latency,
             skip_latency=skip_latency,
             first_impression_success=fis,
@@ -854,12 +945,23 @@ class FeatureExtractor:
 
         out = pd.DataFrame(index=work["customerId"].drop_duplicates())
         out.index.name = "customerId"
-        out["first_seen"] = pd.to_datetime(
-            first_ms.reindex(out.index), unit="ms", utc=True
+        out["first_seen"] = (
+            pd.to_datetime(
+            first_ms.reindex(out.index),
+            unit="ms",
+            utc=True
         )
-        out["last_seen"] = pd.to_datetime(
-            last_ms.reindex(out.index), unit="ms", utc=True
+        .dt.tz_convert("Asia/Kolkata")
+    )
+
+        out["last_seen"] = (
+            pd.to_datetime(
+            last_ms.reindex(out.index),
+            unit="ms",
+            utc=True
         )
+        .dt.tz_convert("Asia/Kolkata")
+    )
         return out
 
     @staticmethod
@@ -987,6 +1089,7 @@ class FeatureExtractor:
         diversity: pd.DataFrame,
         depth: pd.Series,
         timestamps: pd.DataFrame,
+        time_variance: pd.DataFrame,
         click_latency: pd.Series,
         skip_latency: pd.Series,
         first_impression_success: pd.Series,
@@ -998,6 +1101,7 @@ class FeatureExtractor:
             counts.join(diversity, how="outer")
             .join(timestamps, how="left")
             .join(depth, how="left")
+            .join(time_variance, how="left")
         )
         impressions = profile["total_impressions"]
         clicks = profile["total_clicks"]
@@ -1006,6 +1110,16 @@ class FeatureExtractor:
         profile["ctr"] = self._safe_ratio(clicks, impressions, scale=100.0)
         profile["repeat_impression_rate"] = self._safe_ratio(
             profile["repeat_impressions"], impressions, scale=100.0
+        )
+        profile["dropoff_rate"] = (
+            (
+            profile["total_impressions"]
+            - profile["total_clicks"]
+            - profile["total_skips"].fillna(0)
+            )
+            /
+            profile["total_impressions"]
+            * 100
         )
 
         if EVENT_SKIP in present:
