@@ -58,6 +58,123 @@ _CUSTOMER_METRIC_FIELDS: Tuple[Tuple[str, str], ...] = (
     ("Exploration score", "exploration_score"),
 )
 
+# Tooltip definitions for every metric / term used across the dashboard.
+_TOOLTIPS: Dict[str, str] = {
+    # KPI band
+    "Total Events": (
+        "The total number of raw telemetry events recorded across all customers and campaigns "
+        "in the loaded dataset. Includes impressions, clicks, and skips."
+    ),
+    "Total Customers": (
+        "The count of unique customer IDs present in the dataset. "
+        "Each customer may have multiple events across multiple campaigns."
+    ),
+    "Campaigns": (
+        "The number of distinct marketing campaigns tracked in the dataset. "
+        "Each campaign targets customers with specific creatives."
+    ),
+    "Generated Insights": (
+        "The total number of AI-generated insight statements produced by the analytics engine "
+        "across all customers. Insights are grounded strictly in telemetry evidence."
+    ),
+    # Engagement funnel
+    "Impressions": (
+        "How many times a campaign creative was displayed to this customer. "
+        "An impression is recorded every time the content appears on screen."
+    ),
+    "Clicks": (
+        "The number of times the customer actively tapped or clicked on a campaign creative "
+        "after seeing it. A click signals positive engagement."
+    ),
+    "Skips": (
+        "The number of times the customer dismissed or skipped a campaign creative "
+        "before fully viewing it. High skips may indicate poor creative-audience fit."
+    ),
+    "CTR": (
+        "Click-Through Rate — the percentage of impressions that resulted in a click. "
+        "Formula: (Clicks ÷ Impressions) × 100. Higher is better."
+    ),
+    "Skip rate": (
+        "The percentage of impressions that resulted in a skip. "
+        "Formula: (Skips ÷ Impressions) × 100. Lower is generally better."
+    ),
+    # Behavioural metrics table
+    "Repeat impression rate (%)": (
+        "The share of impressions where the same creative was shown to the customer more than once. "
+        "High repeat rates can indicate over-exposure or limited creative rotation."
+    ),
+    "Avg session depth": (
+        "The average number of events (impressions, clicks, skips) recorded per session for this customer. "
+        "A proxy for how deeply the customer engaged during a single visit."
+    ),
+    "Exploration score": (
+        "A normalised score (0–1) reflecting how broadly the customer has explored different campaigns "
+        "or content categories. 1 = maximum variety explored."
+    ),
+    # Composite scores
+    "Engagement Score": (
+        "A composite normalised score (0–1) combining CTR, session depth, and repeat engagement signals. "
+        "Reflects overall campaign interaction quality for this customer."
+    ),
+    "Exploration Score": (
+        "A normalised score (0–1) reflecting how broadly the customer has explored different campaigns "
+        "or content categories. 1 = maximum variety explored."
+    ),
+    "Campaign Receptiveness Score": (
+        "A normalised score (0–1) measuring how positively this customer tends to respond to campaign "
+        "creatives — based on click and engagement rate relative to skips. Higher means more receptive."
+    ),
+    "Loyalty Score": (
+        "A normalised score (0–1) measuring customer retention signals — how consistently this customer "
+        "returns and interacts across multiple sessions."
+    ),
+    "Risk Score": (
+        "A normalised score (0–1) estimating churn or disengagement risk. "
+        "Higher values indicate the customer shows more signs of dropping off."
+    ),
+    "Value Score": (
+        "A normalised score (0–1) estimating this customer's relative commercial value, "
+        "derived from engagement depth and click behaviour."
+    ),
+    # Campaign Intelligence
+    "Customers Reached": (
+        "The number of unique customers who received at least one impression for this campaign. "
+        "Reach is distinct from impressions — a customer counted once regardless of frequency."
+    ),
+    "Top reach": (
+        "The highest 'Customers Reached' value recorded across all campaigns in the dataset. "
+        "Indicates which campaign had the widest audience."
+    ),
+    "Campaigns (count)": (
+        "Total number of active campaigns in the dataset for which performance data is available."
+    ),
+    # Campaign Performance table columns
+    "campaign_impressions": (
+        "Total number of times this campaign's creative was displayed across all customers."
+    ),
+    "campaign_clicks": "Total clicks recorded for this campaign across all customers.",
+    "campaign_skips": "Total skips recorded for this campaign across all customers.",
+    "campaign_ctr": (
+        "Campaign-level Click-Through Rate. Formula: (Total Clicks ÷ Total Impressions) × 100."
+    ),
+    "campaign_skip_rate": (
+        "Campaign-level Skip Rate. Formula: (Total Skips ÷ Total Impressions) × 100."
+    ),
+    "campaign_exposure_frequency": (
+        "Average number of times each reached customer saw this campaign's creative. "
+        "High frequency may cause ad fatigue."
+    ),
+    "campaign_reach": (
+        "Unique customers who received at least one impression of this campaign."
+    ),
+    # Agent panel
+    "confidence": (
+        "The analytics engine's confidence in its answer: HIGH means the answer is fully grounded "
+        "in telemetry evidence; MEDIUM means partial evidence; LOW means the query falls outside "
+        "the supported analytics set and the answer may be unreliable."
+    ),
+}
+
 _OVERVIEW_CAPABILITIES: Tuple[Tuple[str, str], ...] = (
     ("Analytics Engine", "Raw telemetry → evidence-based metrics, scores and insights. Capability-gated; never fabricated."),
     ("Campaign Intelligence", "Per-campaign reach and funnel performance — impressions, clicks, skips, CTR, skip rate."),
@@ -144,7 +261,7 @@ html, body, [class*="css"], .stApp, button, input, textarea, select {
 /* Custom bars (funnel / scores) */
 .bars { margin-top:6px; }
 .bar-row { display:flex; align-items:center; gap:12px; margin:9px 0; }
-.bar-label { width:130px; font-size:.82rem; color:var(--ink); font-weight:500; }
+.bar-label { width:140px; font-size:.82rem; color:var(--ink); font-weight:500; display:flex; align-items:center; flex-shrink:0; }
 .bar-track { flex:1; height:9px; background:var(--surface-2); border-radius:999px; overflow:hidden; }
 .bar-fill { height:100%; background:var(--accent); border-radius:999px; }
 .bar-val { width:64px; text-align:right; font-size:.82rem; color:var(--muted); font-variant-numeric:tabular-nums; }
@@ -179,6 +296,22 @@ button[data-baseweb="tab"][aria-selected="true"] { color:var(--accent); }
 /* Inputs / progress accents */
 [data-baseweb="select"] > div, .stTextInput input { border-radius:10px; }
 [data-testid="stProgress"] > div > div > div > div { background-color:var(--accent); }
+
+/* Tooltip styles — uses native title attribute (always visible, never clipped
+   by parent overflow rules) styled as a small inline "?" badge. */
+.tt-icon {
+  display:inline-flex; align-items:center; justify-content:center;
+  width:14px; height:14px; border-radius:50%;
+  background:var(--surface-2); border:1px solid var(--border);
+  color:var(--muted); font-size:.62rem; font-weight:700; cursor:help;
+  line-height:1; flex-shrink:0; transition:.15s;
+  text-decoration:none; vertical-align:middle; margin-left:5px;
+}
+.tt-icon:hover { background:var(--accent-soft); border-color:var(--accent); color:var(--accent); }
+
+/* KPI with tooltip icon, placed inline beside the label */
+.kpi-label-row { display:flex; align-items:center; gap:0; white-space:nowrap; }
+
 </style>
 """
 
@@ -241,6 +374,29 @@ def fmt(value: Any) -> str:
     if isinstance(value, int):
         return f"{value:,}"
     return str(value)
+
+
+def tt(key: str) -> str:
+    """Return an inline HTML tooltip icon for the given metric key.
+
+    Looks up the definition in ``_TOOLTIPS``. Uses the browser's native
+    ``title`` attribute so the tooltip text is always visible on hover —
+    it is never clipped by a parent's ``overflow`` rule and needs no
+    extra positioning logic. Returns an empty string if the key is not
+    found so callers never need to guard for None.
+    """
+    tip = _TOOLTIPS.get(key, "")
+    if not tip:
+        return ""
+    # Escape characters that could break the HTML attribute.
+    safe_tip = (
+        tip.replace("&", "&amp;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+    return f"<span class='tt-icon' title=\"{safe_tip}\">?</span>"
 
 
 def section_header(eyebrow: str, title: str, desc: str = "") -> None:
@@ -350,15 +506,16 @@ def render_context_bar(customers: List[str]) -> str:
     with st.container(border=True):
         cols = st.columns([2, 3])
         with cols[0]:
-            if customers:
-                customer_id = st.selectbox(
-                    "Active customer", customers, key="active_customer"
-                )
-            else:
-                customer_id = st.text_input(
-                    "Active customer ID", key="active_customer",
-                    placeholder="e.g. 1015289504",
-                )
+            customer_id = st.text_input(
+                "Customer ID",
+                value="1015289504",
+                key="active_customer",
+                help=(
+                    "Enter the unique identifier of the customer you want to analyse. "
+                    "This drives the Customer Intelligence tab, Insights, Evidence, and Agent queries. "
+                    "Leave blank to view only global KPIs and campaign data."
+                ),
+            )
         with cols[1]:
             st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
             cid = (customer_id or "").strip()
@@ -402,8 +559,10 @@ def render_kpis(base_url: str, customer_ids: Tuple[str, ...]) -> None:
     cols = st.columns(4, gap="medium")
     for col, (label, value) in zip(cols, cards):
         col.markdown(
-            f"<div class='kpi'><div class='kpi-label'>{label}</div>"
-            f"<div class='kpi-value'>{value}</div></div>",
+            f"<div class='kpi'>"
+            f"<div class='kpi-label kpi-label-row'>{label}{tt(label)}</div>"
+            f"<div class='kpi-value'>{value}</div>"
+            f"</div>",
             unsafe_allow_html=True,
         )
 
@@ -451,31 +610,81 @@ def render_customer_intelligence(base_url: str, customer_id: str) -> None:
     # Funnel + metrics
     with top[0]:
         with st.container(border=True):
-            st.markdown("<div class='card-title'>Engagement funnel</div>"
-                        f"<div class='card-sub'>Customer {cid}</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div class='card-title'>Engagement funnel</div>"
+                f"<div class='card-sub'>Customer {cid} — impressions, clicks, skips</div>",
+                unsafe_allow_html=True,
+            )
             funnel = [
                 ("Impressions", behavioural.get("total_impressions")),
                 ("Clicks", behavioural.get("total_clicks")),
                 ("Skips", behavioural.get("total_skips")),
             ]
-            st.markdown(bar_chart(funnel), unsafe_allow_html=True)
+            funnel_max = max(
+                (float(v) for _, v in funnel if isinstance(v, (int, float))),
+                default=1.0,
+            ) or 1.0
+            funnel_rows = ""
+            for label, value in funnel:
+                v = float(value) if isinstance(value, (int, float)) else 0.0
+                pct = max(0.0, min(100.0, v / funnel_max * 100.0))
+                funnel_rows += (
+                    f"<div class='bar-row'>"
+                    f"<span class='bar-label'>{label}{tt(label)}</span>"
+                    f"<div class='bar-track'><div class='bar-fill' style='width:{pct:.1f}%'></div></div>"
+                    f"<span class='bar-val'>{fmt(value)}</span>"
+                    f"</div>"
+                )
+            st.markdown(f"<div class='bars'>{funnel_rows}</div>", unsafe_allow_html=True)
             st.write("")
             m = st.columns(2)
-            m[0].metric("CTR", f"{fmt(behavioural.get('ctr'))}%")
-            m[1].metric("Skip rate", f"{fmt(behavioural.get('skip_rate'))}%")
-            rows = [{"Metric": label, "Value": fmt(behavioural.get(key))}
-                    for label, key in _CUSTOMER_METRIC_FIELDS]
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            m[0].metric(
+                "CTR",
+                f"{fmt(behavioural.get('ctr'))}%",
+                help=_TOOLTIPS.get("CTR", ""),
+            )
+            m[1].metric(
+                "Skip rate",
+                f"{fmt(behavioural.get('skip_rate'))}%",
+                help=_TOOLTIPS.get("Skip rate", ""),
+            )
+            st.write("")
+            metric_rows_html = "".join(
+                f"<div style='display:flex;justify-content:space-between;align-items:center;"
+                f"padding:7px 2px;border-bottom:1px solid var(--border)'>"
+                f"<span style='font-size:.85rem;color:var(--ink)'>{label}{tt(label)}</span>"
+                f"<span style='font-size:.85rem;color:var(--muted);font-variant-numeric:tabular-nums'>"
+                f"{fmt(behavioural.get(key))}</span>"
+                f"</div>"
+                for label, key in _CUSTOMER_METRIC_FIELDS
+            )
+            st.markdown(metric_rows_html, unsafe_allow_html=True)
     # Scores
     with top[1]:
         with st.container(border=True):
-            st.markdown("<div class='card-title'>Composite scores</div>"
-                        "<div class='card-sub'>Normalised 0–1</div>", unsafe_allow_html=True)
+            st.markdown(
+                "<div class='card-title'>Composite scores</div>"
+                "<div class='card-sub'>Normalised 0–1 &nbsp;—&nbsp; "
+                "hover the <b>?</b> next to each score for its definition</div>",
+                unsafe_allow_html=True,
+            )
             if not scores:
                 st.caption("No scores returned.")
             else:
-                pairs = [(name.replace("_", " ").title(), value) for name, value in scores.items()]
-                st.markdown(bar_chart(pairs, max_value=1.0), unsafe_allow_html=True)
+                score_rows = ""
+                top_val = 1.0
+                for name, value in scores.items():
+                    display_name = name.replace("_", " ").title()
+                    v = float(value) if isinstance(value, (int, float)) else 0.0
+                    pct = max(0.0, min(100.0, v / (top_val or 1.0) * 100.0))
+                    score_rows += (
+                        f"<div class='bar-row'>"
+                        f"<span class='bar-label'>{display_name}{tt(display_name)}</span>"
+                        f"<div class='bar-track'><div class='bar-fill' style='width:{pct:.1f}%'></div></div>"
+                        f"<span class='bar-val'>{fmt(value)}</span>"
+                        f"</div>"
+                    )
+                st.markdown(f"<div class='bars'>{score_rows}</div>", unsafe_allow_html=True)
 
     # Insights
     with st.container(border=True):
@@ -511,12 +720,24 @@ def render_campaign_intelligence(base_url: str) -> None:
 
     campaigns = data.get("campaigns") or []
     with st.container(border=True):
-        st.markdown("<div class='card-title'>Customers reached</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='card-title'>Customers reached"
+            f"{tt('Customers Reached')}</div>",
+            unsafe_allow_html=True,
+        )
         c = st.columns(2)
-        c[0].metric("Campaigns", fmt(data.get("n_campaigns")))
+        c[0].metric(
+            "Campaigns",
+            fmt(data.get("n_campaigns")),
+            help=_TOOLTIPS.get("Campaigns (count)", ""),
+        )
         if campaigns:
             reach = [int(r.get("customers_reached", 0)) for r in campaigns]
-            c[1].metric("Top reach", fmt(max(reach)) if reach else "—")
+            c[1].metric(
+                "Top reach",
+                fmt(max(reach)) if reach else "—",
+                help=_TOOLTIPS.get("Top reach", ""),
+            )
         if not campaigns:
             st.caption("No campaign data available.")
         else:
@@ -563,14 +784,35 @@ def render_campaign_performance() -> None:
             df, hide_index=True, use_container_width=True,
             column_config={
                 "campaign": st.column_config.TextColumn("Campaign", width="large"),
-                "impressions": st.column_config.NumberColumn("Impressions", format="%d"),
-                "clicks": st.column_config.NumberColumn("Clicks", format="%d"),
-                "skips": st.column_config.NumberColumn("Skips", format="%d"),
+                "impressions": st.column_config.NumberColumn(
+                    "Impressions", format="%d",
+                    help=_TOOLTIPS.get("campaign_impressions", ""),
+                ),
+                "clicks": st.column_config.NumberColumn(
+                    "Clicks", format="%d",
+                    help=_TOOLTIPS.get("campaign_clicks", ""),
+                ),
+                "skips": st.column_config.NumberColumn(
+                    "Skips", format="%d",
+                    help=_TOOLTIPS.get("campaign_skips", ""),
+                ),
                 # Already 0-100; shown as % but kept numeric so the column sorts.
-                "ctr": st.column_config.NumberColumn("CTR", format="%.2f%%"),
-                "skip_rate": st.column_config.NumberColumn("Skip Rate", format="%.2f%%"),
-                "exposure_frequency": st.column_config.NumberColumn("Exposure Freq.", format="%.2f"),
-                "reach": st.column_config.NumberColumn("Reach", format="%d"),
+                "ctr": st.column_config.NumberColumn(
+                    "CTR", format="%.2f%%",
+                    help=_TOOLTIPS.get("campaign_ctr", ""),
+                ),
+                "skip_rate": st.column_config.NumberColumn(
+                    "Skip Rate", format="%.2f%%",
+                    help=_TOOLTIPS.get("campaign_skip_rate", ""),
+                ),
+                "exposure_frequency": st.column_config.NumberColumn(
+                    "Exposure Freq.", format="%.2f",
+                    help=_TOOLTIPS.get("campaign_exposure_frequency", ""),
+                ),
+                "reach": st.column_config.NumberColumn(
+                    "Reach", format="%d",
+                    help=_TOOLTIPS.get("campaign_reach", ""),
+                ),
             },
         )
 
@@ -595,7 +837,8 @@ def _run_agent_query(question: str, customer_id: str) -> None:
 
     st.write("")
     st.markdown(
-        f"<span class='card-sub'>Confidence</span>&nbsp;&nbsp;{confidence_badge(confidence)}",
+        f"<span class='card-sub'>Confidence</span>{tt('confidence')}"
+        f"&nbsp;&nbsp;{confidence_badge(confidence)}",
         unsafe_allow_html=True,
     )
     st.markdown(f"<div class='answer-card'>{answer}</div>", unsafe_allow_html=True)
@@ -644,6 +887,12 @@ def render_agent_panel(customer_id: str) -> None:
             query = st.text_input(
                 "Analytics query", key="agent_query",
                 placeholder="e.g. explain the engagement score for the active customer",
+                help=(
+                    "Type a natural-language question about the dataset, a specific customer, "
+                    "campaigns, findings, or evidence. The agent is deterministic — it answers "
+                    "only from telemetry data and returns 'insufficient evidence' rather than guessing. "
+                    "Use the suggested queries above for guaranteed grounded results."
+                ),
             )
             submitted = st.form_submit_button("Run query", type="primary")
 
@@ -714,7 +963,15 @@ def render_sidebar() -> str:
         st.markdown("<div class='card-title'>Workspace</div>"
                     "<div class='card-sub'>Connection & data</div>", unsafe_allow_html=True)
         st.divider()
-        base_url = st.text_input("Analytics API URL", value=DEFAULT_API_URL)
+        base_url = st.text_input(
+            "Analytics API URL",
+            value=DEFAULT_API_URL,
+            help=(
+                "The base URL of the analytics HTTP API. "
+                "Start it with: uvicorn api.app:app --host 127.0.0.1 --port 8000. "
+                "The dashboard is read-only — it only fetches data from this API."
+            ),
+        )
         if st.button("Refresh data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
