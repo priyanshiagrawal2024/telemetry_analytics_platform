@@ -1,0 +1,188 @@
+# =============================================================================
+# Column Registry — Semantic Schema (single source of truth for column meaning)
+# =============================================================================
+#
+# Purpose
+#   Map each RAW column emitted by the telemetry source to a DOMAIN-NEUTRAL
+#   semantic role. The analytics framework reasons about semantic roles, never
+#   about hardcoded column names. To onboard a new domain (telecom, finance,
+#   healthcare, ecommerce), ship a new registry that maps THAT domain's columns
+#   onto the same role vocabulary — no framework code changes required.
+#
+# Schema for every entry
+#   <raw_column_name>:
+#     semantic_role: <role from the controlled vocabulary below>
+#     description:   <what the column means, domain-neutral>
+#     data_type:     string | long | datetime | object
+#     required:      true | false   (required for the system to operate today)
+#
+# Controlled semantic-role vocabulary (domain-agnostic)
+#   entity_id          The primary entity being analyzed (customer/account/patient/user).
+#   session_id         Logical session / journey grouping for the entity.
+#   event_time         Authoritative event occurrence time.
+#   event_name         Raw event type; drives canonical behavioural classification.
+#   group_id           The campaign / group / treatment / product an event belongs to.
+#   action_label       Specific action/outcome chosen; may encode sub-state (e.g. skip).
+#   surface            Screen / surface / context where the event occurred.
+#   platform           Delivery platform / channel.
+#   device_os          Operating system of the device.
+#   device_id          Device identifier.
+#   client_id          Client / application-instance identifier.
+#   transaction_id     Correlation / transaction identifier.
+#   source_system      Originating system or application.
+#   client_version     Client / application version.
+#   event_category     Categorical bucket of the event.
+#   stream_type        Telemetry stream / record type.
+#   payload            Nested, free-form structured metadata.
+#   display_time       Human-readable / localized time, for display only (non-authoritative).
+#   metadata           Retained for lineage; not consumed by analytics.
+#
+# This registry describes the MyJio telemetry export (event_schema.md v2.0,
+# 23 columns). Role assignments are intentionally domain-neutral.
+# =============================================================================
+
+# --- Core analytical fields (event_schema.md §2) -----------------------------
+
+customerId:
+  semantic_role: entity_id
+  description: Unique entity being analyzed (the customer in this domain).
+  data_type: string
+  required: true
+
+event_type:
+  semantic_role: event_name
+  description: Raw event type emitted by the source; drives canonical behavioural classification (impression / click / skip).
+  data_type: string
+  required: true
+
+event_timestamp:
+  semantic_role: event_time
+  description: Authoritative timestamp of event occurrence, epoch milliseconds (UTC).
+  data_type: long
+  required: true
+
+sessionId:
+  semantic_role: session_id
+  description: Logical session identifier for the entity. Funnel-required; may be null on non-funnel rows.
+  data_type: string
+  required: true
+
+newscreen_name:
+  semantic_role: surface
+  description: Screen / surface / context that generated the event.
+  data_type: string
+  required: false
+
+platform:
+  semantic_role: platform
+  description: Delivery platform / channel (e.g. Android / iOS).
+  data_type: string
+  required: false
+
+os:
+  semantic_role: device_os
+  description: Operating system of the device.
+  data_type: string
+  required: false
+
+# --- Grouping & action fields (event_schema.md §3, §6) -----------------------
+
+click_action:
+  semantic_role: group_id
+  description: Identifier of the campaign / group / treatment the event belongs to (the stable grouping key).
+  data_type: string
+  required: false
+
+label:
+  semantic_role: action_label
+  description: The specific action or outcome chosen on the event; may encode sub-state signals (e.g. skip / dismiss markers). NOT the grouping key.
+  data_type: string
+  required: false
+
+# --- Lineage / metadata columns (retained, not consumed by analytics) --------
+
+event_category:
+  semantic_role: event_category
+  description: Categorical bucket of the event (e.g. CUSTOM_EVENT).
+  data_type: string
+  required: false
+
+source:
+  semantic_role: source_system
+  description: Originating system or application package.
+  data_type: string
+  required: false
+
+version:
+  semantic_role: client_version
+  description: Client / application version.
+  data_type: string
+  required: false
+
+txId:
+  semantic_role: transaction_id
+  description: Correlation / transaction identifier for the record.
+  data_type: string
+  required: false
+
+clientId:
+  semantic_role: client_id
+  description: Client / application-instance identifier.
+  data_type: string
+  required: false
+
+androidId:
+  semantic_role: device_id
+  description: Device identifier.
+  data_type: string
+  required: false
+
+swipe:
+  semantic_role: metadata
+  description: Interaction detail retained for lineage; not consumed by analytics.
+  data_type: string
+  required: false
+
+type:
+  semantic_role: stream_type
+  description: Telemetry stream / record type (e.g. clickstream_custom_events).
+  data_type: string
+  required: false
+
+api_request:
+  semantic_role: metadata
+  description: Associated API request detail retained for lineage; not consumed by analytics.
+  data_type: string
+  required: false
+
+additional_info:
+  semantic_role: payload
+  description: Nested, free-form structured metadata accompanying the event.
+  data_type: object
+  required: false
+
+extra_info:
+  semantic_role: payload
+  description: Additional nested telemetry metadata.
+  data_type: object
+  required: false
+
+# --- Non-authoritative / unreliable time columns (event_schema.md §9) --------
+
+timestamp:
+  semantic_role: display_time
+  description: String timestamp from the source. Unreliable in the validated sample; not used as the authoritative time (see event_time).
+  data_type: string
+  required: false
+
+timestamp_ist:
+  semantic_role: display_time
+  description: Human-readable IST timestamp. Unreliable / often empty in the validated sample; not authoritative.
+  data_type: datetime
+  required: false
+
+IST:
+  semantic_role: display_time
+  description: Localized IST time column for display only. Unreliable; not authoritative.
+  data_type: string
+  required: false

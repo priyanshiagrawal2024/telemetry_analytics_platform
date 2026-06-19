@@ -1,6 +1,18 @@
-# MyJio Floater Analytics Platform — Python dependencies
+# Infrastructure / API dependencies
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+asyncpg>=0.29
+
+# Configuration
+pyyaml>=6.0
+
+# Analytics dependencies
 pandas>=2.0
 numpy>=1.24
-openpyxl>=3.1        # read the XLSX-disguised-as-CSV telemetry export
-PyYAML>=6.0          # configs/*.yaml (semantic mappings, analytics thresholds)
-reportlab>=4.0       # reports/pdf_report_generator.py (PDF export)
+openpyxl>=3.1
+reportlab>=4.0
+
+# Dashboard
+streamlit>=1.30
+requests>=2.31
